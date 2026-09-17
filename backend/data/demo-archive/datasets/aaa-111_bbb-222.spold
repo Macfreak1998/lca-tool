@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ecoSpold xmlns="http://www.EcoInvent.org/EcoSpold02">
+  <activityDataset>
+    <activityDescription>
+      <activity id="aaa-111" activityName="market for maize starch" />
+      <geography>
+        <shortname>DE</shortname>
+      </geography>
+    </activityDescription>
+    <flowData>
+      <intermediateExchange id="ref-1" intermediateExchangeId="bbb-222" amount="1">
+        <name>maize starch</name>
+        <unitName>kg</unitName>
+        <outputGroup>0</outputGroup>
+      </intermediateExchange>
+      <elementaryExchange elementaryExchangeId="flow-co2" amount="0.5">
+        <name>Carbon dioxide, fossil</name>
+        <unitName>kg</unitName>
+        <outputGroup>4</outputGroup>
+      </elementaryExchange>
+      <elementaryExchange elementaryExchangeId="flow-so2" amount="0.1">
+        <name>Sulfur dioxide</name>
+        <unitName>kg</unitName>
+        <outputGroup>4</outputGroup>
+      </elementaryExchange>
+    </flowData>
+  </activityDataset>
+</ecoSpold>

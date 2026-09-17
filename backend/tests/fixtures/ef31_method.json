@@ -1,0 +1,8 @@
+{
+  "method_id": "EF3.1",
+  "factors": [
+    {"flow_id": "flow-co2", "indicator": "climate_change", "value": 1.0},
+    {"flow_id": "flow-co2", "indicator": "climate_change_fossil", "value": 1.0},
+    {"flow_id": "flow-so2", "indicator": "acidification", "value": 1.31}
+  ]
+}

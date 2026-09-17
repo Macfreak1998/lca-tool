@@ -1,0 +1,8 @@
+{
+  "method_id": "EF3.1",
+  "comment": "Beispiel-/Testdatei. Für den produktiven Import die offizielle EF-3.1-Faktorliste hinterlegen (EF31_METHOD_PATH).",
+  "factors": [
+    {"flow_id": "flow-co2", "indicator": "climate_change", "value": 1.0},
+    {"flow_id": "flow-co2", "indicator": "climate_change_fossil", "value": 1.0}
+  ]
+}

@@ -1,0 +1,33 @@
+services:
+  api:
+    build:
+      context: ./backend
+    environment:
+      ADMIN_EMAIL: admin@localhost
+      ADMIN_PASSWORD: admin
+      SECRET_KEY: compose-secret
+      DATABASE_URL: sqlite:////data/lca.sqlite3
+      CORS_ORIGINS: http://localhost:5173
+      PUBLIC_SIGNUP: "true"
+      APP_BASE_URL: http://localhost:5173
+      ARCHIVE_PATH: /app/data/demo-archive
+      EF31_METHOD_PATH: /app/data/ef31_method.json
+      DEMO_SEED: "true"
+    volumes:
+      - lca-data:/data
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      API_PROXY: http://api:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  lca-data:
