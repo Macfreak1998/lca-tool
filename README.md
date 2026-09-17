@@ -11,6 +11,8 @@ In diesem Repository liegt **kein lizenziertes ecoinvent-Archiv**, nur ein klein
 Voraussetzung: [Docker Desktop](https://www.docker.com/products/docker-desktop/).
 
 ```bash
+git clone https://github.com/Macfreak1998/lca-tool.git
+cd lca-tool
 docker compose up --build
 ```
 
