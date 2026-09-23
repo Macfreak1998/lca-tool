@@ -14,6 +14,7 @@ import { ResetPasswordPage } from "./pages/ResetPassword";
 import { UserDatasetsPage } from "./pages/UserDatasets";
 import { AdminHomePage } from "./pages/admin/AdminHome";
 import { ArchivePage } from "./pages/admin/Archive";
+import { CatalogPage } from "./pages/admin/Catalog";
 import { ChainEditorPage } from "./pages/admin/ChainEditor";
 import { ChainsPage } from "./pages/admin/Chains";
 import { EndProductsPage } from "./pages/admin/EndProducts";
@@ -59,6 +60,7 @@ export function App() {
         >
           <Route index element={<AdminHomePage />} />
           <Route path="archiv" element={<ArchivePage />} />
+          <Route path="katalog" element={<CatalogPage />} />
           <Route path="kategorien" element={<RolesPage />} />
           <Route path="endprodukte" element={<EndProductsPage />} />
           <Route path="ketten" element={<ChainsPage />} />

@@ -38,10 +38,15 @@ class RoleIn(BaseModel):
     slug: str | None = None
 
 
+class RoleUpdateIn(BaseModel):
+    label: str = Field(min_length=1, max_length=200)
+
+
 class RoleOut(BaseModel):
     id: int
     slug: str
     label: str
+    dataset_count: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -78,6 +83,10 @@ class ArchiveHit(BaseModel):
 class CatalogImportIn(BaseModel):
     filename: str
     role_id: int
+
+
+class CatalogDatasetUpdateIn(BaseModel):
+    role_ids: list[int]
 
 
 class FactorOut(BaseModel):
@@ -131,24 +140,52 @@ class CatalogFromProposalIn(BaseModel):
     role_id: int | None = None
 
 
-class SlotIn(BaseModel):
+class NodeIn(BaseModel):
     id: int | None = None
-    role_id: int
-    required: bool = True
-    optional_default_off: bool = False
-    min_count: int = 1
-    specific_amount: float
-    unit: str
-    default_dataset_id: int | None = None
-    default_share: float = 1.0
-
-
-class StageIn(BaseModel):
-    id: int | None = None
+    client_key: str
+    type: str
     name: str
-    sort_order: int = 0
-    upstream_amount: float = 1.0
-    slots: list[SlotIn] = Field(default_factory=list)
+    position_x: float = 0
+    position_y: float = 0
+    role_id: int | None = None
+    dataset_id: int | None = None
+    unit: str = ""
+    distance_km: float | None = None
+    optional: bool = False
+    is_functional: bool = False
+    datasets_differ: bool = False
+
+
+class EdgeIn(BaseModel):
+    id: int | None = None
+    source_key: str
+    target_key: str
+    kind: str = "material"
+    input_amount: float = 1.0
+    efficiency: float = 1.0
+
+
+class CombinationAxisIn(BaseModel):
+    category_key: str
+    dataset_id: int
+
+
+class CombinationAmountIn(BaseModel):
+    category_key: str
+    input_amount: float = 0.0
+    recovery_key: str | None = None
+
+
+class CombinationIn(BaseModel):
+    process_key: str
+    axes: list[CombinationAxisIn] = Field(default_factory=list)
+    amounts: list[CombinationAmountIn] = Field(default_factory=list)
+
+
+class DatasetShareIn(BaseModel):
+    category_key: str
+    dataset_id: int
+    default_share: float = 1.0
 
 
 class ChainCreateIn(BaseModel):
@@ -159,28 +196,58 @@ class ChainCreateIn(BaseModel):
 class ChainUpdateIn(BaseModel):
     name: str | None = None
     status: str | None = None
-    stages: list[StageIn] | None = None
+    nodes: list[NodeIn] | None = None
+    edges: list[EdgeIn] | None = None
+    combinations: list[CombinationIn] | None = None
+    dataset_shares: list[DatasetShareIn] | None = None
 
 
-class SlotOut(BaseModel):
+class NodeOut(BaseModel):
     id: int
-    role_id: int
-    required: bool
-    optional_default_off: bool
-    min_count: int
-    specific_amount: float
-    unit: str
-    default_dataset_id: int | None
-    default_share: float
-
-
-class StageOut(BaseModel):
-    id: int
+    type: str
     name: str
-    sort_order: int
-    outgoing_stage_id: int | None
-    upstream_amount: float
-    slots: list[SlotOut]
+    position_x: float
+    position_y: float
+    role_id: int | None
+    dataset_id: int | None
+    unit: str
+    distance_km: float | None
+    optional: bool
+    is_functional: bool
+    datasets_differ: bool
+
+
+class EdgeOut(BaseModel):
+    id: int
+    source_id: int
+    target_id: int
+    kind: str
+    input_amount: float
+    efficiency: float
+
+
+class CombinationAxisOut(BaseModel):
+    category_node_id: int
+    dataset_id: int | None
+
+
+class CombinationAmountOut(BaseModel):
+    category_node_id: int
+    input_amount: float
+    recovery_node_id: int | None
+
+
+class CombinationOut(BaseModel):
+    id: int
+    process_node_id: int
+    axes: list[CombinationAxisOut]
+    amounts: list[CombinationAmountOut]
+
+
+class DatasetShareOut(BaseModel):
+    category_node_id: int
+    dataset_id: int
+    default_share: float
 
 
 class ChainOut(BaseModel):
@@ -190,15 +257,10 @@ class ChainOut(BaseModel):
     end_product_id: int
     end_unit: str
     end_product_name: str
-    stages: list[StageOut]
-
-
-class ExtraSlotIn(BaseModel):
-    key: str
-    stage_id: int
-    role_id: int
-    dataset_id: int | None = None
-    share: float = 0.0
+    nodes: list[NodeOut]
+    edges: list[EdgeOut]
+    combinations: list[CombinationOut]
+    dataset_shares: list[DatasetShareOut]
 
 
 class CalculateIn(BaseModel):
@@ -207,16 +269,15 @@ class CalculateIn(BaseModel):
     selections: dict[str, int] = Field(default_factory=dict)
     shares: dict[str, float] = Field(default_factory=dict)
     optional_on: list[int] = Field(default_factory=list)
-    extra_slots: list[ExtraSlotIn] = Field(default_factory=list)
-    replaced_stages: dict[str, int] = Field(default_factory=dict)
+    replaced_nodes: dict[str, int] = Field(default_factory=dict)
 
 
 class ContributionOut(BaseModel):
-    stage_id: int
-    stage_name: str
+    node_id: int
+    node_name: str
     role_id: int
     role_label: str
-    slot_key: str
+    use_key: str
     dataset_id: int
     dataset_name: str
     amount: float
@@ -247,8 +308,7 @@ class ConfigurationIn(BaseModel):
     selections: dict[str, int] = Field(default_factory=dict)
     shares: dict[str, float] = Field(default_factory=dict)
     optional_on: list[int] = Field(default_factory=list)
-    extra_slots: list[ExtraSlotIn] = Field(default_factory=list)
-    replaced_stages: dict[str, int] = Field(default_factory=dict)
+    replaced_nodes: dict[str, int] = Field(default_factory=dict)
 
 
 class ConfigurationOut(BaseModel):
@@ -261,8 +321,7 @@ class ConfigurationOut(BaseModel):
     selections: dict[str, int]
     shares: dict[str, float]
     optional_on: list[int]
-    extra_slots: list[ExtraSlotIn]
-    replaced_stages: dict[str, int]
+    replaced_nodes: dict[str, int]
     chain_name: str
     end_product_id: int
     end_product_name: str

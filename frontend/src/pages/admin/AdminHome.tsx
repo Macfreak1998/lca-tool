@@ -20,6 +20,11 @@ export function AdminHomePage() {
           </Link>
         </li>
         <li>
+          <Link className="text-forest-700 underline" to="/admin/katalog">
+            Katalog prüfen und Kategorien zuweisen
+          </Link>
+        </li>
+        <li>
           <Link className="text-forest-700 underline" to="/admin/endprodukte">
             Endprodukt anlegen
           </Link>

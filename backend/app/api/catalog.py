@@ -6,12 +6,15 @@ from sqlalchemy.orm import selectinload
 from app.constants import SOURCE_CATALOG_MANUAL, SOURCE_ECOINVENT
 from app.deps import AdminUser, CurrentUser, DbDep
 from app.models import Dataset, DatasetExchange, DatasetFactor, DatasetProposal, DatasetRole, Role
-from app.schemas import CatalogFromProposalIn, CatalogImportIn, DatasetOut
+from app.schemas import CatalogDatasetUpdateIn, CatalogFromProposalIn, CatalogImportIn, DatasetOut
 from app.serialize import dataset_out
 from app.services.archive import dataset_file, get_archive_path
 from app.services.characterize import parse_spold
+from app.services.datasets import prepare_dataset_delete
 
 router = APIRouter()
+
+CATALOG_SOURCES = (SOURCE_ECOINVENT, SOURCE_CATALOG_MANUAL)
 
 
 @router.get("/datasets", response_model=list[DatasetOut])
@@ -30,7 +33,7 @@ def list_datasets(
     if source:
         query = query.filter(Dataset.source_kind == source)
     else:
-        query = query.filter(Dataset.source_kind.in_([SOURCE_ECOINVENT, SOURCE_CATALOG_MANUAL]))
+        query = query.filter(Dataset.source_kind.in_(CATALOG_SOURCES))
     if role:
         query = query.join(DatasetRole).filter(DatasetRole.role_id == role)
     rows = query.order_by(Dataset.name).all()
@@ -96,6 +99,59 @@ def import_dataset(payload: CatalogImportIn, _admin: AdminUser, db: DbDep) -> Da
     db.commit()
     db.refresh(dataset)
     return dataset_out(dataset)
+
+
+def _catalog_dataset(db, dataset_id: int) -> Dataset:
+    dataset = (
+        db.query(Dataset)
+        .options(
+            selectinload(Dataset.roles),
+            selectinload(Dataset.factors),
+            selectinload(Dataset.exchanges),
+        )
+        .filter(Dataset.id == dataset_id, Dataset.source_kind.in_(CATALOG_SOURCES))
+        .first()
+    )
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Katalogdatensatz nicht gefunden.")
+    return dataset
+
+
+def _replace_roles(db, dataset: Dataset, role_ids: list[int]) -> None:
+    seen: list[int] = []
+    for role_id in role_ids:
+        if role_id in seen:
+            continue
+        if db.get(Role, role_id) is None:
+            raise HTTPException(status_code=400, detail="Kategorie nicht gefunden.")
+        seen.append(role_id)
+    if not seen:
+        raise HTTPException(status_code=400, detail="Bitte mindestens eine Kategorie zuweisen.")
+    current = {row.role_id: row for row in dataset.roles}
+    wanted = set(seen)
+    for role_id, row in list(current.items()):
+        if role_id not in wanted:
+            dataset.roles.remove(row)
+    for role_id in seen:
+        if role_id not in current:
+            dataset.roles.append(DatasetRole(role_id=role_id))
+
+
+@router.patch("/datasets/{dataset_id}", response_model=DatasetOut)
+def update_dataset(dataset_id: int, payload: CatalogDatasetUpdateIn, _admin: AdminUser, db: DbDep) -> DatasetOut:
+    dataset = _catalog_dataset(db, dataset_id)
+    _replace_roles(db, dataset, payload.role_ids)
+    db.commit()
+    return dataset_out(_catalog_dataset(db, dataset_id))
+
+
+@router.delete("/datasets/{dataset_id}")
+def delete_dataset(dataset_id: int, _admin: AdminUser, db: DbDep) -> dict:
+    dataset = _catalog_dataset(db, dataset_id)
+    prepare_dataset_delete(db, dataset.id, "Ein Katalogdatensatz wurde gelöscht.")
+    db.delete(dataset)
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/from-proposal", response_model=DatasetOut)

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from itertools import product as cartesian
 
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import Chain, Configuration, Dataset, Role
-from app.services.calculate import CalcInput, calculate, ordered_stages
+from app.services.calculate import CalcInput, calculate, has_cycle, share_key
+from app.services.units import same_unit, unit_mismatch_message
 
 
 def invalidate_configurations(db: Session, chain_id: int, reason: str) -> None:
@@ -16,36 +18,194 @@ def invalidate_configurations(db: Session, chain_id: int, reason: str) -> None:
     db.commit()
 
 
+def _shares_ok(values: list[float]) -> bool:
+    if len(values) < 2:
+        return True
+    share_sum = sum(values)
+    return abs(share_sum - 1.0) <= 1e-6 or abs(share_sum - 100.0) <= 1e-6
+
+
 def validate_structure(chain: Chain) -> list[str]:
     errors: list[str] = []
-    stages = ordered_stages(chain)
-    if not stages:
-        errors.append("Mindestens eine Stufe ist nötig.")
+    nodes = list(chain.nodes)
+    edges = list(chain.edges)
+    combinations = list(chain.combinations)
+    if not nodes:
+        errors.append("Mindestens ein Knoten ist nötig.")
         return errors
-    seen_outgoing: set[int] = set()
-    for stage in stages:
-        if stage.outgoing_stage_id:
-            if stage.outgoing_stage_id in seen_outgoing:
-                errors.append("Eine Stufe darf nur eine eingehende Vorgängerstufe haben.")
-            seen_outgoing.add(stage.outgoing_stage_id)
-        grouped: dict[int, list] = defaultdict(list)
-        for slot in stage.slots:
-            grouped[slot.role_id].append(slot)
-            if slot.specific_amount < 0:
-                errors.append(f"Menge in Stufe „{stage.name}“ darf nicht negativ sein.")
-        for slots in grouped.values():
-            required = [slot for slot in slots if slot.required and not slot.optional_default_off]
-            for slot in required:
-                if slot.default_dataset_id is None:
-                    errors.append(
-                        f"Default-Datensatz fehlt für einen Pflicht-Slot in „{stage.name}“."
-                    )
-            if len(slots) > 1:
-                share_sum = sum(slot.default_share for slot in slots)
-                if abs(share_sum - 1.0) > 1e-6 and abs(share_sum - 100.0) > 1e-6:
-                    errors.append(
-                        f"Default-Anteile in „{stage.name}“ müssen 100 % ergeben."
-                    )
+    functional = [node for node in nodes if node.is_functional]
+    if len(functional) != 1:
+        errors.append("Die Kette braucht genau ein Endprodukt.")
+    if has_cycle(nodes, edges):
+        errors.append("Die Kette enthält einen Zyklus.")
+
+    by_id = {node.id: node for node in nodes}
+    waste_from = {edge.source_id for edge in edges if edge.kind == "waste"}
+    kind_of: dict[tuple[int, int], str] = {}
+    incoming: dict[int, list] = defaultdict(list)
+    produced_by: dict[int, list] = defaultdict(list)
+
+    for edge in edges:
+        source = by_id.get(edge.source_id)
+        target = by_id.get(edge.target_id)
+        if source is None or target is None:
+            errors.append("Eine Kante verweist auf einen fehlenden Knoten.")
+            continue
+        if edge.input_amount < 0:
+            errors.append(f"Menge der Kante nach „{target.name}“ darf nicht negativ sein.")
+        if edge.kind == "waste":
+            continue
+        if source.type == "category" and target.type == "process":
+            kind_of[(target.id, source.id)] = edge.kind
+            incoming[target.id].append(source)
+        if (
+            edge.kind == "material"
+            and edge.input_amount > 1
+            and target.type == "process"
+            and source.type in {"product", "transport"}
+            and target.id not in waste_from
+        ):
+            errors.append(f"Verwertung fehlt für Abfall an „{target.name}“.")
+        if edge.kind == "material" and source.type == "process" and target.type == "product":
+            produced_by[target.id].append(source)
+
+    for process in nodes:
+        if process.type != "process":
+            continue
+        outs = [
+            edge
+            for edge in edges
+            if edge.source_id == process.id
+            and edge.kind == "material"
+            and by_id.get(edge.target_id) is not None
+            and by_id[edge.target_id].type == "product"
+        ]
+        if len(outs) != 1:
+            errors.append(f"Prozess „{process.name}“ braucht genau ein Folgeprodukt.")
+
+    for product_id, producers in produced_by.items():
+        if len(producers) > 1:
+            errors.append(f"„{by_id[product_id].name}“ darf nur einen Prozess haben.")
+
+    shares_by_category: dict[int, list] = defaultdict(list)
+    for share in chain.dataset_shares:
+        shares_by_category[share.category_node_id].append(share)
+
+    for process in nodes:
+        if process.type != "process":
+            continue
+        categories = incoming.get(process.id, [])
+        differing = [node for node in categories if node.datasets_differ]
+        combos = [item for item in combinations if item.process_node_id == process.id]
+        axis_sets: list[list[tuple[int, int]]] = []
+        missing_axis = False
+        for category in differing:
+            dataset_ids = sorted(
+                {
+                    axis.dataset_id
+                    for combo in combos
+                    for axis in combo.axes
+                    if axis.category_node_id == category.id and axis.dataset_id is not None
+                }
+            )
+            if not dataset_ids:
+                errors.append(f"Datensätze fehlen für „{category.name}“.")
+                missing_axis = True
+                continue
+            axis_sets.append([(category.id, dataset_id) for dataset_id in dataset_ids])
+            if len(dataset_ids) > 1:
+                rows = [
+                    share
+                    for share in shares_by_category[category.id]
+                    if share.dataset_id in dataset_ids
+                ]
+                if len(rows) != len(dataset_ids) or not _shares_ok([share.default_share for share in rows]):
+                    errors.append(f"Default-Anteile für „{category.name}“ müssen 100 % ergeben.")
+        if not missing_axis and differing:
+            expected = {frozenset(choice) for choice in cartesian(*axis_sets)}
+            stored = [
+                frozenset(
+                    (axis.category_node_id, axis.dataset_id)
+                    for axis in combo.axes
+                    if axis.dataset_id is not None
+                )
+                for combo in combos
+            ]
+            if set(stored) != expected or len(stored) != len(expected):
+                errors.append(f"Kombination fehlt für „{process.name}“.")
+        elif not differing and categories and not any(not combo.axes for combo in combos):
+            errors.append(f"Kombination fehlt für „{process.name}“.")
+
+        required = [node for node in categories if node.datasets_differ or not node.optional]
+        for combo in combos:
+            present = {amount.category_node_id for amount in combo.amounts}
+            for category in required:
+                if category.id not in present:
+                    errors.append(f"Menge fehlt für „{category.name}“ an „{process.name}“.")
+            for amount in combo.amounts:
+                if amount.input_amount < 0:
+                    errors.append(f"Mengen an „{process.name}“ dürfen nicht negativ sein.")
+                kind = kind_of.get((process.id, amount.category_node_id), "material")
+                if kind == "material" and amount.input_amount > 1 and amount.recovery_node_id is None:
+                    errors.append(f"Verwertung fehlt für Abfall an „{process.name}“.")
+
+        for category in categories:
+            if category.datasets_differ or category.optional:
+                continue
+            rows = shares_by_category[category.id]
+            if not rows:
+                errors.append(f"Anteile fehlen für „{category.name}“.")
+            elif not _shares_ok([share.default_share for share in rows]):
+                errors.append(f"Default-Anteile für „{category.name}“ müssen 100 % ergeben.")
+
+    for node in nodes:
+        if node.type == "transport" and not node.optional:
+            if node.dataset_id is None:
+                errors.append(f"Datensatz fehlt für Transport „{node.name}“.")
+            if not node.distance_km or node.distance_km <= 0:
+                errors.append(f"Distanz fehlt für Transport „{node.name}“.")
+        if node.type == "recovery" and node.dataset_id is None:
+            referenced = any(
+                amount.recovery_node_id == node.id
+                for combo in combinations
+                for amount in combo.amounts
+            ) or any(edge.kind == "waste" and edge.target_id == node.id for edge in edges)
+            if referenced:
+                errors.append(f"Datensatz fehlt für Verwertung „{node.name}“.")
+        if node.type == "category" and node.role_id is None:
+            errors.append(f"Kategorie fehlt am Knoten „{node.name}“.")
+        if node.type == "category" and node.datasets_differ and node.optional:
+            errors.append(f"„{node.name}“ ist ungleich und darf nicht optional sein.")
+
+    errors.extend(_category_unit_errors(chain))
+    return errors
+
+
+def _category_unit_errors(chain: Chain) -> list[str]:
+    by_id = {node.id: node for node in chain.nodes}
+    seen: set[tuple[int, int]] = set()
+    errors: list[str] = []
+    pairs: list[tuple[int, Dataset | None]] = []
+    for share in chain.dataset_shares:
+        pairs.append((share.category_node_id, share.dataset))
+    for combo in chain.combinations:
+        for axis in combo.axes:
+            if axis.dataset_id is None:
+                continue
+            pairs.append((axis.category_node_id, axis.dataset))
+    for category_id, dataset in pairs:
+        if dataset is None:
+            continue
+        key = (category_id, dataset.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        category = by_id.get(category_id)
+        if category is None or category.type != "category":
+            continue
+        if same_unit(dataset.unit, category.unit):
+            continue
+        errors.append(unit_mismatch_message(dataset.name, dataset.unit, category.name, category.unit))
     return errors
 
 
@@ -55,24 +215,25 @@ def probe_and_publish(db: Session, chain: Chain) -> tuple[bool, list[str]]:
         return False, errors
     datasets = {
         item.id: item
-        for item in db.query(Dataset).options(
+        for item in db.query(Dataset)
+        .options(
             selectinload(Dataset.factors),
             selectinload(Dataset.roles),
             selectinload(Dataset.exchanges),
-        ).all()
+        )
+        .all()
     }
     roles = {item.id: item for item in db.query(Role).all()}
     selections: dict[str, int] = {}
     shares: dict[str, float] = {}
-    optional_on: list[int] = []
-    for stage in chain.stages:
-        for slot in stage.slots:
-            if slot.default_dataset_id:
-                selections[str(slot.id)] = slot.default_dataset_id
-            shares[str(slot.id)] = slot.default_share
+    for node in chain.nodes:
+        if node.dataset_id:
+            selections[str(node.id)] = node.dataset_id
+    for share in chain.dataset_shares:
+        shares[share_key(share.category_node_id, share.dataset_id)] = share.default_share
     result = calculate(
         chain,
-        CalcInput(end_amount=1.0, selections=selections, shares=shares, optional_on=optional_on),
+        CalcInput(end_amount=1.0, selections=selections, shares=shares, optional_on=[]),
         datasets,
         roles,
         require_published=False,

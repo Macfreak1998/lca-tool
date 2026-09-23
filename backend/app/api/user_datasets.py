@@ -5,18 +5,10 @@ from sqlalchemy.orm import selectinload
 
 from app.constants import CLIMATE_CHANGE, SOURCE_USER
 from app.deps import CurrentUser, DbDep
-from app.models import (
-    Configuration,
-    ConfigurationExtraSlot,
-    ConfigurationReplacedStage,
-    ConfigurationSelection,
-    Dataset,
-    DatasetProposal,
-    DatasetRole,
-    Role,
-)
+from app.models import Dataset, DatasetProposal, DatasetRole, Role
 from app.schemas import DatasetOut, UserDatasetIn, UserDatasetUpdateIn
 from app.serialize import dataset_out, replace_factors
+from app.services.datasets import prepare_dataset_delete
 
 router = APIRouter()
 
@@ -35,27 +27,6 @@ def _owned(db, user_id: int, dataset_id: int) -> Dataset:
     if row is None:
         raise HTTPException(status_code=404, detail="Eigener Datensatz nicht gefunden.")
     return row
-
-
-def _invalidate_using(db, dataset_id: int, reason: str) -> None:
-    ids: set[int] = set()
-    for item in db.query(ConfigurationSelection.configuration_id).filter(
-        ConfigurationSelection.dataset_id == dataset_id
-    ):
-        ids.add(item[0])
-    for item in db.query(ConfigurationExtraSlot.configuration_id).filter(
-        ConfigurationExtraSlot.dataset_id == dataset_id
-    ):
-        ids.add(item[0])
-    for item in db.query(ConfigurationReplacedStage.configuration_id).filter(
-        ConfigurationReplacedStage.dataset_id == dataset_id
-    ):
-        ids.add(item[0])
-    if ids:
-        db.query(Configuration).filter(Configuration.id.in_(ids)).update(
-            {"invalid": True, "invalid_reason": reason},
-            synchronize_session=False,
-        )
 
 
 @router.get("", response_model=list[DatasetOut])
@@ -123,7 +94,7 @@ def update_mine(
 @router.delete("/{dataset_id}")
 def delete_mine(dataset_id: int, user: CurrentUser, db: DbDep) -> dict:
     dataset = _owned(db, user.id, dataset_id)
-    _invalidate_using(db, dataset.id, "Ein eigener Datensatz wurde gelöscht.")
+    prepare_dataset_delete(db, dataset.id, "Ein eigener Datensatz wurde gelöscht.")
     db.delete(dataset)
     db.commit()
     return {"ok": True}

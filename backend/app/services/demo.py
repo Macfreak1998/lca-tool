@@ -6,7 +6,20 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.constants import CHAIN_DRAFT, SOURCE_ECOINVENT
-from app.models import Chain, Dataset, DatasetExchange, DatasetRole, EndProduct, Role, Slot, Stage
+from app.models import (
+    Chain,
+    ChainEdge,
+    ChainNode,
+    ChainCombination,
+    ChainCombinationAmount,
+    ChainCombinationAxis,
+    ChainDatasetShare,
+    Dataset,
+    DatasetExchange,
+    DatasetRole,
+    EndProduct,
+    Role,
+)
 from app.services.archive import dataset_file
 from app.services.characterize import parse_spold
 from app.services.publish import probe_and_publish
@@ -71,17 +84,71 @@ def seed_demo(db: Session) -> None:
     )
     db.add(chain)
     db.flush()
-    stage = Stage(chain=chain, name="Folie", sort_order=0, upstream_amount=1.0)
-    db.add(stage)
+    folie = ChainNode(
+        chain=chain,
+        type="product",
+        name="Folie",
+        unit="kg",
+        is_functional=True,
+        position_x=480,
+        position_y=180,
+    )
+    category = ChainNode(
+        chain=chain,
+        type="category",
+        name="Stärke",
+        role_id=starch.id,
+        unit="kg",
+        datasets_differ=True,
+        position_x=40,
+        position_y=180,
+    )
+    process = ChainNode(
+        chain=chain,
+        type="process",
+        name="Herstellung",
+        unit="kg",
+        position_x=260,
+        position_y=180,
+    )
+    db.add_all([folie, category, process])
     db.flush()
+    db.add_all(
+        [
+            ChainEdge(
+                chain=chain,
+                source_id=category.id,
+                target_id=process.id,
+                kind="material",
+                input_amount=1.0,
+                efficiency=1.0,
+            ),
+            ChainEdge(
+                chain=chain,
+                source_id=process.id,
+                target_id=folie.id,
+                kind="material",
+                input_amount=1.0,
+                efficiency=1.0,
+            ),
+        ]
+    )
+    combo = ChainCombination(chain=chain, process_node_id=process.id)
+    db.add(combo)
+    db.flush()
+    db.add(ChainCombinationAxis(combination=combo, category_node_id=category.id, dataset_id=dataset.id))
     db.add(
-        Slot(
-            stage=stage,
-            role_id=starch.id,
-            required=True,
-            specific_amount=1.0,
-            unit="kg",
-            default_dataset_id=dataset.id,
+        ChainCombinationAmount(
+            combination=combo,
+            category_node_id=category.id,
+            input_amount=1.0,
+        )
+    )
+    db.add(
+        ChainDatasetShare(
+            chain=chain,
+            category_node_id=category.id,
+            dataset_id=dataset.id,
             default_share=1.0,
         )
     )

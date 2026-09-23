@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 from app.constants import METHOD_ID, SOURCE_USER
-from app.models import Chain, Configuration, Dataset, DatasetFactor, User
+from app.models import Chain, Configuration, Dataset, DatasetFactor, Role, User
 from app.schemas import (
     CalculateOut,
     ChainOut,
     ConfigurationOut,
     ContributionOut,
     DatasetOut,
-    ExtraSlotIn,
+    EdgeOut,
     FactorOut,
     InventorySummaryOut,
-    SlotOut,
-    StageOut,
+    NodeOut,
+    RoleOut,
     UserOut,
+    CombinationAmountOut,
+    CombinationAxisOut,
+    CombinationOut,
+    DatasetShareOut,
 )
-from app.services.calculate import CalcInput, CalcResult, ExtraSlot
+from app.services.calculate import CalcInput, CalcResult
+
+
+def role_out(role: Role, dataset_count: int = 0) -> RoleOut:
+    return RoleOut(id=role.id, slug=role.slug, label=role.label, dataset_count=dataset_count)
 
 
 def user_out(user: User) -> UserOut:
@@ -53,31 +61,6 @@ def dataset_out(dataset: Dataset, *, include_factors: bool = False) -> DatasetOu
 
 
 def chain_out(chain: Chain) -> ChainOut:
-    stages = []
-    for stage in sorted(chain.stages, key=lambda item: item.sort_order):
-        stages.append(
-            StageOut(
-                id=stage.id,
-                name=stage.name,
-                sort_order=stage.sort_order,
-                outgoing_stage_id=stage.outgoing_stage_id,
-                upstream_amount=stage.upstream_amount,
-                slots=[
-                    SlotOut(
-                        id=slot.id,
-                        role_id=slot.role_id,
-                        required=slot.required,
-                        optional_default_off=slot.optional_default_off,
-                        min_count=slot.min_count,
-                        specific_amount=slot.specific_amount,
-                        unit=slot.unit,
-                        default_dataset_id=slot.default_dataset_id,
-                        default_share=slot.default_share,
-                    )
-                    for slot in stage.slots
-                ],
-            )
-        )
     return ChainOut(
         id=chain.id,
         name=chain.name,
@@ -85,21 +68,68 @@ def chain_out(chain: Chain) -> ChainOut:
         end_product_id=chain.end_product_id,
         end_unit=chain.end_unit,
         end_product_name=chain.end_product.name if chain.end_product else "",
-        stages=stages,
+        nodes=[
+            NodeOut(
+                id=node.id,
+                type=node.type,
+                name=node.name,
+                position_x=node.position_x,
+                position_y=node.position_y,
+                role_id=node.role_id,
+                dataset_id=node.dataset_id,
+                unit=node.unit,
+                distance_km=node.distance_km,
+                optional=node.optional,
+                is_functional=node.is_functional,
+                datasets_differ=node.datasets_differ,
+            )
+            for node in chain.nodes
+        ],
+        edges=[
+            EdgeOut(
+                id=edge.id,
+                source_id=edge.source_id,
+                target_id=edge.target_id,
+                kind=edge.kind,
+                input_amount=edge.input_amount,
+                efficiency=edge.efficiency,
+            )
+            for edge in chain.edges
+        ],
+        combinations=[
+            CombinationOut(
+                id=combo.id,
+                process_node_id=combo.process_node_id,
+                axes=[
+                    CombinationAxisOut(
+                        category_node_id=axis.category_node_id,
+                        dataset_id=axis.dataset_id,
+                    )
+                    for axis in combo.axes
+                ],
+                amounts=[
+                    CombinationAmountOut(
+                        category_node_id=amount.category_node_id,
+                        input_amount=amount.input_amount,
+                        recovery_node_id=amount.recovery_node_id,
+                    )
+                    for amount in combo.amounts
+                ],
+            )
+            for combo in chain.combinations
+        ],
+        dataset_shares=[
+            DatasetShareOut(
+                category_node_id=share.category_node_id,
+                dataset_id=share.dataset_id,
+                default_share=share.default_share,
+            )
+            for share in chain.dataset_shares
+        ],
     )
 
 
 def configuration_out(row: Configuration) -> ConfigurationOut:
-    extras = [
-        ExtraSlotIn(
-            key=f"extra:{item.id}",
-            stage_id=item.stage_id,
-            role_id=item.role_id,
-            dataset_id=item.dataset_id,
-            share=item.share,
-        )
-        for item in row.extra_slots
-    ]
     return ConfigurationOut(
         id=row.id,
         name=row.name,
@@ -107,11 +137,10 @@ def configuration_out(row: Configuration) -> ConfigurationOut:
         end_amount=row.end_amount,
         invalid=row.invalid,
         invalid_reason=row.invalid_reason,
-        selections={str(item.slot_id): item.dataset_id for item in row.selections},
-        shares={item.slot_key: item.percent for item in row.shares},
-        optional_on=[item.slot_id for item in row.optional_on],
-        extra_slots=extras,
-        replaced_stages={str(item.stage_id): item.dataset_id for item in row.replaced_stages},
+        selections={str(item.node_id): item.dataset_id for item in row.selections},
+        shares={f"{item.category_node_id}:{item.dataset_id}": item.percent for item in row.shares},
+        optional_on=[item.node_id for item in row.optional_on],
+        replaced_nodes={str(item.node_id): item.dataset_id for item in row.replaced_nodes},
         chain_name=row.chain.name if row.chain else "",
         end_product_id=row.chain.end_product_id if row.chain else 0,
         end_product_name=row.chain.end_product.name if row.chain and row.chain.end_product else "",
@@ -123,20 +152,10 @@ def configuration_out(row: Configuration) -> ConfigurationOut:
 def calc_input_from_config(row: Configuration) -> CalcInput:
     return CalcInput(
         end_amount=row.end_amount,
-        selections={str(item.slot_id): item.dataset_id for item in row.selections},
-        shares={item.slot_key: item.percent for item in row.shares},
-        optional_on=[item.slot_id for item in row.optional_on],
-        extra_slots=[
-            ExtraSlot(
-                key=f"extra:{item.id}",
-                stage_id=item.stage_id,
-                role_id=item.role_id,
-                dataset_id=item.dataset_id,
-                share=item.share,
-            )
-            for item in row.extra_slots
-        ],
-        replaced_stages={item.stage_id: item.dataset_id for item in row.replaced_stages},
+        selections={str(item.node_id): item.dataset_id for item in row.selections},
+        shares={f"{item.category_node_id}:{item.dataset_id}": item.percent for item in row.shares},
+        optional_on=[item.node_id for item in row.optional_on],
+        replaced_nodes={item.node_id: item.dataset_id for item in row.replaced_nodes},
     )
 
 
@@ -146,11 +165,11 @@ def calc_out(result: CalcResult) -> CalculateOut:
         totals=result.totals,
         contributions=[
             ContributionOut(
-                stage_id=row.stage_id,
-                stage_name=row.stage_name,
+                node_id=row.node_id,
+                node_name=row.node_name,
                 role_id=row.role_id,
                 role_label=row.role_label,
-                slot_key=row.slot_key,
+                use_key=row.use_key,
                 dataset_id=row.dataset_id,
                 dataset_name=row.dataset_name,
                 amount=row.amount,

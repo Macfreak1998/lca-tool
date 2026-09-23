@@ -1,120 +1,444 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { DataApi } from "../../api";
-import type { Chain, Dataset, Role, Slot, Stage } from "../../types";
+import { ChainGraph, type GraphEdge, type GraphNode } from "../../components/ChainGraph";
+import type { Chain, Dataset, EdgeKind, NodeType, Role } from "../../types";
 
-type DraftSlot = Omit<Slot, "id"> & { id?: number; key: string };
-type DraftStage = Omit<Stage, "id" | "slots"> & { id?: number; key: string; slots: DraftSlot[] };
+type DraftNode = GraphNode & {
+  id?: number;
+  role_id: number | null;
+  dataset_id: number | null;
+  unit: string;
+  distance_km: number | null;
+  datasets_differ: boolean;
+};
 
-function toDraft(chain: Chain): DraftStage[] {
-  return chain.stages.map((stage) => ({
-    ...stage,
-    key: `s-${stage.id}`,
-    slots: stage.slots.map((slot) => ({ ...slot, key: `p-${slot.id}` })),
+type DraftAmount = {
+  category_key: string;
+  input_amount: number;
+  recovery_key: string | null;
+};
+
+type DraftCombination = {
+  key: string;
+  process_key: string;
+  axes: { category_key: string; dataset_id: number }[];
+  amounts: DraftAmount[];
+};
+
+function formatQuantity(value: number): string {
+  return String(Math.round((value + Number.EPSILON) * 1000) / 1000);
+}
+
+type DraftShare = {
+  category_key: string;
+  dataset_id: number;
+  default_share: number;
+};
+
+type DraftEdge = GraphEdge & { id?: number };
+
+const TYPE_LABEL: Record<NodeType, string> = {
+  category: "Kategorie",
+  product: "Produkt",
+  process: "Prozess",
+  transport: "Transport",
+  recovery: "Verwertung",
+};
+
+function axisKey(axes: { category_key: string; dataset_id: number }[]) {
+  return axes
+    .map((axis) => `${axis.category_key}:${axis.dataset_id}`)
+    .sort()
+    .join("|");
+}
+
+function cartesian<T>(lists: T[][]): T[][] {
+  return lists.reduce<T[][]>((rows, list) => rows.flatMap((row) => list.map((item) => [...row, item])), [[]]);
+}
+
+function canonicalUnit(unit: string): string {
+  const text = unit.trim().toLowerCase().replace(/·/g, "*").replace(/-/g, "").replace(/\s+/g, "");
+  if (text === "kilowatthour") return "kwh";
+  if (text === "kilogram") return "kg";
+  return text;
+}
+
+function sameUnit(left: string, right: string): boolean {
+  return canonicalUnit(left) === canonicalUnit(right);
+}
+
+function categoryTitle(node: { type: string; name: string; role_id: number | null }, roles: Role[]): string {
+  if (node.type !== "category") return node.name;
+  const role = roles.find((item) => item.id === node.role_id)?.label;
+  if (!role) return node.name;
+  if (!node.name || node.name === TYPE_LABEL.category || node.name === role) return role;
+  return `${node.name} (${role})`;
+}
+
+function nodeKey(id: number) {
+  return `n-${id}`;
+}
+
+function toDraft(chain: Chain) {
+  const nodes: DraftNode[] = chain.nodes.map((node) => ({
+    id: node.id,
+    key: nodeKey(node.id),
+    type: node.type,
+    name: node.name,
+    x: node.position_x,
+    y: node.position_y,
+    is_functional: node.is_functional,
+    optional: node.optional,
+    role_id: node.role_id,
+    dataset_id: node.dataset_id,
+    unit: node.unit,
+    distance_km: node.distance_km,
+    datasets_differ: node.datasets_differ,
   }));
+  const edges: DraftEdge[] = chain.edges.map((edge) => ({
+    id: edge.id,
+    key: `e-${edge.id}`,
+    source: nodeKey(edge.source_id),
+    target: nodeKey(edge.target_id),
+    kind: edge.kind,
+    input_amount: edge.input_amount,
+    efficiency: edge.efficiency,
+  }));
+  const combinations: DraftCombination[] = chain.combinations.map((combo) => {
+    const axes = combo.axes
+      .filter((axis) => axis.dataset_id != null)
+      .map((axis) => ({ category_key: nodeKey(axis.category_node_id), dataset_id: axis.dataset_id as number }));
+    return {
+      key: `${nodeKey(combo.process_node_id)}::${axisKey(axes)}`,
+      process_key: nodeKey(combo.process_node_id),
+      axes,
+      amounts: combo.amounts.map((amount) => ({
+        category_key: nodeKey(amount.category_node_id),
+        input_amount: amount.input_amount,
+        recovery_key: amount.recovery_node_id ? nodeKey(amount.recovery_node_id) : null,
+      })),
+    };
+  });
+  const shares: DraftShare[] = chain.dataset_shares.map((share) => ({
+    category_key: nodeKey(share.category_node_id),
+    dataset_id: share.dataset_id,
+    default_share: share.default_share,
+  }));
+  return { nodes, edges, combinations, shares };
 }
 
 export function ChainEditorPage() {
   const { id } = useParams();
   const chainId = Number(id);
   const [chain, setChain] = useState<Chain | null>(null);
-  const [stages, setStages] = useState<DraftStage[]>([]);
+  const [nodes, setNodes] = useState<DraftNode[]>([]);
+  const [edges, setEdges] = useState<DraftEdge[]>([]);
+  const [combinations, setCombinations] = useState<DraftCombination[]>([]);
+  const [shares, setShares] = useState<DraftShare[]>([]);
   const [roles, setRoles] = useState<Role[]>([]);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
   async function load() {
     const [c, r, d] = await Promise.all([DataApi.chain(chainId), DataApi.roles(), DataApi.datasets()]);
     setChain(c);
-    setStages(toDraft(c));
     setRoles(r);
     setDatasets(d);
+    const draft = toDraft(c);
+    setNodes(draft.nodes);
+    setEdges(draft.edges);
+    setCombinations(draft.combinations);
+    setShares(draft.shares);
   }
 
   useEffect(() => {
     void load();
   }, [chainId]);
 
-  function addStage() {
-    setStages((current) => [
+  useEffect(() => {
+    if (datasets.length === 0) return;
+    const roleDatasets = (roleId: number | null) =>
+      roleId == null ? [] : datasets.filter((item) => item.role_ids.includes(roleId));
+    setCombinations((current) => {
+      const next: DraftCombination[] = [];
+      for (const process of nodes.filter((node) => node.type === "process")) {
+        const categories = edges
+          .filter((edge) => edge.target === process.key && edge.kind !== "waste")
+          .map((edge) => nodes.find((node) => node.key === edge.source && node.type === "category"))
+          .filter((node): node is DraftNode => Boolean(node));
+        const differing = categories.filter((node) => node.datasets_differ);
+        const lists = differing.map((category) =>
+          roleDatasets(category.role_id).map((dataset) => ({ category_key: category.key, dataset_id: dataset.id })),
+        );
+        if (categories.length === 0 || lists.some((list) => list.length === 0)) continue;
+        const specs = lists.length === 0 ? [[]] : cartesian(lists);
+        for (const axes of specs) {
+          const key = `${process.key}::${axisKey(axes)}`;
+          const previous = current.find((combo) => combo.key === key);
+          const sibling = current.find((combo) => combo.process_key === process.key);
+          next.push({
+            key,
+            process_key: process.key,
+            axes,
+            amounts: categories.map((category) => {
+              const kept = previous?.amounts.find((amount) => amount.category_key === category.key);
+              const copied = sibling?.amounts.find((amount) => amount.category_key === category.key);
+              return {
+                category_key: category.key,
+                input_amount: kept?.input_amount ?? (category.datasets_differ ? 0 : copied?.input_amount ?? 0),
+                recovery_key: kept?.recovery_key ?? null,
+              };
+            }),
+          });
+        }
+      }
+      const same =
+        next.length === current.length &&
+        next.every((combo, index) => {
+          const other = current[index];
+          return (
+            combo.key === other.key &&
+            combo.amounts.length === other.amounts.length &&
+            combo.amounts.every(
+              (amount, amountIndex) =>
+                amount.category_key === other.amounts[amountIndex].category_key &&
+                amount.input_amount === other.amounts[amountIndex].input_amount &&
+                amount.recovery_key === other.amounts[amountIndex].recovery_key,
+            )
+          );
+        });
+      return same ? current : next;
+    });
+    setShares((current) => {
+      const needed: DraftShare[] = [];
+      const seen = new Set<string>();
+      for (const edge of edges) {
+        if (edge.kind === "waste") continue;
+        const source = nodes.find((node) => node.key === edge.source);
+        const target = nodes.find((node) => node.key === edge.target);
+        if (!source || source.type !== "category" || !target || target.type !== "process") continue;
+        const rows = roleDatasets(source.role_id);
+        rows.forEach((dataset) => {
+          const key = `${source.key}:${dataset.id}`;
+          if (seen.has(key)) return;
+          seen.add(key);
+          const existing = current.find((share) => share.category_key === source.key && share.dataset_id === dataset.id);
+          needed.push({
+            category_key: source.key,
+            dataset_id: dataset.id,
+            default_share: existing?.default_share ?? (rows.length === 1 ? 1 : 0),
+          });
+        });
+      }
+      const same =
+        needed.length === current.length &&
+        needed.every(
+          (share, index) =>
+            share.category_key === current[index].category_key &&
+            share.dataset_id === current[index].dataset_id &&
+            share.default_share === current[index].default_share,
+        );
+      return same ? current : needed;
+    });
+  }, [edges, nodes, datasets]);
+
+  function addNode(type: NodeType) {
+    const key = `n-${Date.now()}`;
+    setNodes((current) => [
       ...current,
       {
-        key: `s-${Date.now()}`,
-        name: "Neue Stufe",
-        sort_order: current.length,
-        outgoing_stage_id: null,
-        upstream_amount: 1,
-        slots: [],
+        key,
+        type,
+        name: TYPE_LABEL[type],
+        x: 80 + current.length * 24,
+        y: 80 + current.length * 24,
+        is_functional: false,
+        optional: type === "transport",
+        role_id: type === "category" ? roles[0]?.id ?? null : null,
+        dataset_id: null,
+        unit: type === "transport" ? "kg·km" : "kg",
+        distance_km: type === "transport" ? 100 : null,
+        datasets_differ: false,
       },
     ]);
+    setSelected(key);
   }
 
-  function addSlot(stageKey: string) {
-    setStages((current) =>
-      current.map((stage) =>
-        stage.key === stageKey
+  function patchNode(key: string, patch: Partial<DraftNode>) {
+    setNodes((current) => current.map((node) => (node.key === key ? { ...node, ...patch } : node)));
+  }
+
+  function patchEdge(key: string, patch: Partial<DraftEdge>) {
+    setEdges((current) => current.map((edge) => (edge.key === key ? { ...edge, ...patch } : edge)));
+  }
+
+  function patchAmount(comboKey: string, categoryKey: string, patch: Partial<DraftAmount>) {
+    setCombinations((current) =>
+      current.map((combo) =>
+        combo.key === comboKey
           ? {
-              ...stage,
-              slots: [
-                ...stage.slots,
-                {
-                  key: `p-${Date.now()}`,
-                  role_id: roles[0]?.id || 0,
-                  required: true,
-                  optional_default_off: false,
-                  min_count: 1,
-                  specific_amount: 1,
-                  unit: "kg",
-                  default_dataset_id: null,
-                  default_share: 1,
-                },
-              ],
+              ...combo,
+              amounts: combo.amounts.map((amount) =>
+                amount.category_key === categoryKey ? { ...amount, ...patch } : amount,
+              ),
             }
-          : stage,
+          : combo,
       ),
     );
   }
 
-  async function save() {
+  function patchShare(categoryKey: string, datasetId: number, defaultShare: number) {
+    setShares((current) =>
+      current.map((share) =>
+        share.category_key === categoryKey && share.dataset_id === datasetId
+          ? { ...share, default_share: defaultShare }
+          : share,
+      ),
+    );
+  }
+
+  function removeNode(key: string) {
+    const node = nodes.find((item) => item.key === key);
+    if (!node || node.is_functional) return;
+    setNodes((current) => current.filter((item) => item.key !== key));
+    setEdges((current) => current.filter((edge) => edge.source !== key && edge.target !== key));
+    setCombinations((current) => current.filter((combo) => combo.process_key !== key));
+    setShares((current) => current.filter((share) => share.category_key !== key));
+    setSelected(null);
+  }
+
+  function connect(source: string, target: string) {
+    const from = nodes.find((node) => node.key === source);
+    const to = nodes.find((node) => node.key === target);
+    if (!from || !to || source === target) return;
+    let kind: EdgeKind = "material";
+    if (to.type === "recovery") kind = "waste";
+    else if (from.type === "category" && from.name.toLowerCase().includes("energie")) kind = "energy";
+    setEdges((current) => [
+      ...current,
+      {
+        key: `e-${Date.now()}`,
+        source,
+        target,
+        kind,
+        input_amount: 1,
+        efficiency: 1,
+      },
+    ]);
+  }
+
+  const selectedNode = nodes.find((node) => node.key === selected) || null;
+  const selectedEdge = edges.find((edge) => edge.key === selected) || null;
+  const processCombinations = combinations.filter((combo) => combo.process_key === selectedNode?.key);
+  const categories = nodes.filter((node) => node.type === "category");
+  const recoveries = nodes.filter((node) => node.type === "recovery");
+
+  function datasetsForCategory(node: DraftNode): Dataset[] {
+    if (node.role_id == null) return [];
+    return datasets.filter((item) => item.role_ids.includes(node.role_id as number));
+  }
+
+  function unitPreview(node: DraftNode): string {
+    if (node.type !== "category") return node.unit;
+    const rows = datasetsForCategory(node);
+    if (rows.length > 0) {
+      const first = rows[0].unit;
+      if (rows.every((row) => sameUnit(row.unit, first))) return first;
+      return node.unit;
+    }
+    const energy = edges.some((edge) => edge.source === node.key && edge.kind === "energy");
+    if (energy && (!node.unit.trim() || sameUnit(node.unit, "kg"))) return "kWh";
+    return node.unit || "kg";
+  }
+
+  function unitWarnings(node: DraftNode): string[] {
+    if (node.type !== "category") return [];
+    const rows = datasetsForCategory(node);
+    if (rows.length === 0 || rows.every((row) => sameUnit(row.unit, rows[0].unit))) return [];
+    return rows
+      .filter((row) => !sameUnit(row.unit, node.unit))
+      .map((row) => `Einheit von „${row.name}“ (${row.unit}) passt nicht zu „${node.name}“ (${node.unit}).`);
+  }
+  const graphNodes = useMemo<GraphNode[]>(
+    () =>
+      nodes.map((node) => ({
+        key: node.key,
+        type: node.type,
+        name: categoryTitle(node, roles),
+        x: node.x,
+        y: node.y,
+        is_functional: node.is_functional,
+        optional: node.optional,
+      })),
+    [nodes, roles],
+  );
+
+  async function save(): Promise<boolean> {
     setError("");
     setMessage("");
     try {
       const saved = await DataApi.saveChain(chainId, {
         name: chain?.name,
-        stages: stages.map((stage, index) => ({
-          id: stage.id,
-          name: stage.name,
-          sort_order: index,
-          upstream_amount: stage.upstream_amount,
-          slots: stage.slots.map((slot) => ({
-            id: slot.id,
-            role_id: slot.role_id,
-            required: slot.required,
-            optional_default_off: slot.optional_default_off,
-            min_count: slot.min_count,
-            specific_amount: slot.specific_amount,
-            unit: slot.unit,
-            default_dataset_id: slot.default_dataset_id,
-            default_share: slot.default_share,
-          })),
+        nodes: nodes.map((node) => ({
+          id: node.id,
+          client_key: node.key,
+          type: node.type,
+          name: node.name,
+          position_x: node.x,
+          position_y: node.y,
+          role_id: node.role_id,
+          dataset_id: node.type === "category" ? null : node.dataset_id,
+          unit: node.unit,
+          distance_km: node.distance_km,
+          optional: node.optional,
+          is_functional: node.is_functional,
+          datasets_differ: node.datasets_differ,
         })),
+        edges: edges.map((edge) => ({
+          id: edge.id,
+          source_key: edge.source,
+          target_key: edge.target,
+          kind: edge.kind,
+          input_amount: edge.input_amount,
+          efficiency: edge.efficiency,
+        })),
+        combinations: combinations.map((combo) => ({
+          process_key: combo.process_key,
+          axes: combo.axes,
+          amounts: combo.amounts,
+        })),
+        dataset_shares: shares,
       });
       setChain(saved);
-      setStages(toDraft(saved));
+      const draft = toDraft(saved);
+      setNodes(draft.nodes);
+      setEdges(draft.edges);
+      setCombinations(draft.combinations);
+      setShares(draft.shares);
+      setSelected(null);
       setMessage("Entwurf gespeichert.");
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Speichern fehlgeschlagen.");
+      return false;
     }
   }
 
   async function publish() {
     setError("");
     try {
-      await save();
+      const saved = await save();
+      if (!saved) return;
       const published = await DataApi.publishChain(chainId);
       setChain(published);
-      setStages(toDraft(published));
+      const draft = toDraft(published);
+      setNodes(draft.nodes);
+      setEdges(draft.edges);
+      setCombinations(draft.combinations);
+      setShares(draft.shares);
       setMessage("Veröffentlicht.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Veröffentlichen fehlgeschlagen.");
@@ -133,178 +457,328 @@ export function ChainEditorPage() {
       </div>
       <p className="text-sm text-slate-600">
         {chain.end_product_name} · {chain.end_unit} · {chain.status === "published" ? "veröffentlicht" : "Entwurf"}.
-        Stufen von vorn nach hinten. Das Zwischenprodukt fließt; `Menge Vorgänger` gilt je Einheit Stufenausgang.
+        Knoten verbinden. Mengen stehen in den Kombinationen des Prozesses.
       </p>
-      {stages.map((stage, index) => (
-        <section key={stage.key} className="card space-y-3">
-          <div className="grid gap-3 md:grid-cols-[1fr_160px_auto]">
-            <input
-              className="input"
-              value={stage.name}
-              onChange={(e) =>
-                setStages((current) => current.map((item) => (item.key === stage.key ? { ...item, name: e.target.value } : item)))
-              }
-            />
-            {index > 0 && (
-              <div>
-                <label className="label">Menge Vorgänger</label>
-                <input
-                  className="input"
-                  type="number"
-                  step="any"
-                  value={stage.upstream_amount}
-                  onChange={(e) =>
-                    setStages((current) =>
-                      current.map((item) =>
-                        item.key === stage.key ? { ...item, upstream_amount: Number(e.target.value) } : item,
-                      ),
-                    )
-                  }
-                />
-              </div>
-            )}
-            <button className="btn-secondary h-10 self-end" type="button" onClick={() => addSlot(stage.key)}>
-              Slot
-            </button>
-          </div>
-          {stage.slots.map((slot) => (
-            <div key={slot.key} className="grid gap-2 rounded-lg bg-slate-50 p-3 md:grid-cols-6">
-              <select
-                className="input"
-                value={slot.role_id}
-                onChange={(e) =>
-                  setStages((current) =>
-                    current.map((item) =>
-                      item.key === stage.key
-                        ? {
-                            ...item,
-                            slots: item.slots.map((s) => (s.key === slot.key ? { ...s, role_id: Number(e.target.value) } : s)),
-                          }
-                        : item,
-                    ),
-                  )
-                }
-              >
-                {roles.map((role) => (
-                  <option key={role.id} value={role.id}>
-                    {role.label}
-                  </option>
-                ))}
-              </select>
-              <input
-                className="input"
-                type="number"
-                step="any"
-                value={slot.specific_amount}
-                onChange={(e) =>
-                  setStages((current) =>
-                    current.map((item) =>
-                      item.key === stage.key
-                        ? {
-                            ...item,
-                            slots: item.slots.map((s) =>
-                              s.key === slot.key ? { ...s, specific_amount: Number(e.target.value) } : s,
-                            ),
-                          }
-                        : item,
-                    ),
-                  )
-                }
-              />
-              <input
-                className="input"
-                value={slot.unit}
-                onChange={(e) =>
-                  setStages((current) =>
-                    current.map((item) =>
-                      item.key === stage.key
-                        ? { ...item, slots: item.slots.map((s) => (s.key === slot.key ? { ...s, unit: e.target.value } : s)) }
-                        : item,
-                    ),
-                  )
-                }
-              />
-              <select
-                className="input"
-                value={slot.default_dataset_id || ""}
-                onChange={(e) =>
-                  setStages((current) =>
-                    current.map((item) =>
-                      item.key === stage.key
-                        ? {
-                            ...item,
-                            slots: item.slots.map((s) =>
-                              s.key === slot.key
-                                ? { ...s, default_dataset_id: e.target.value ? Number(e.target.value) : null }
-                                : s,
-                            ),
-                          }
-                        : item,
-                    ),
-                  )
-                }
-              >
-                <option value="">Default-Datensatz</option>
-                {datasets
-                  .filter((item) => item.role_ids.includes(slot.role_id))
-                  .map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.name}
-                      {item.location ? ` (${item.location})` : ""}
-                    </option>
-                  ))}
-              </select>
-              <input
-                className="input"
-                type="number"
-                step="any"
-                value={slot.default_share}
-                onChange={(e) =>
-                  setStages((current) =>
-                    current.map((item) =>
-                      item.key === stage.key
-                        ? {
-                            ...item,
-                            slots: item.slots.map((s) =>
-                              s.key === slot.key ? { ...s, default_share: Number(e.target.value) } : s,
-                            ),
-                          }
-                        : item,
-                    ),
-                  )
-                }
-              />
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={slot.optional_default_off}
-                  onChange={(e) =>
-                    setStages((current) =>
-                      current.map((item) =>
-                        item.key === stage.key
-                          ? {
-                              ...item,
-                              slots: item.slots.map((s) =>
-                                s.key === slot.key
-                                  ? { ...s, optional_default_off: e.target.checked, required: !e.target.checked }
-                                  : s,
-                              ),
-                            }
-                          : item,
-                      ),
-                    )
-                  }
-                />
-                optional
-              </label>
-            </div>
-          ))}
-        </section>
-      ))}
-      <div className="flex flex-wrap gap-3">
-        <button className="btn-secondary" type="button" onClick={addStage}>
-          Stufe hinzufügen
+      <div className="flex flex-wrap gap-2">
+        <button className="btn-secondary" type="button" onClick={() => addNode("category")}>
+          Kategorie
         </button>
+        <button className="btn-secondary" type="button" onClick={() => addNode("product")}>
+          Produkt
+        </button>
+        <button className="btn-secondary" type="button" onClick={() => addNode("process")}>
+          Prozess
+        </button>
+        <button className="btn-secondary" type="button" onClick={() => addNode("transport")}>
+          Transport
+        </button>
+        <button className="btn-secondary" type="button" onClick={() => addNode("recovery")}>
+          Verwertung
+        </button>
+      </div>
+      <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
+        <ChainGraph
+          nodes={graphNodes}
+          edges={edges}
+          onMove={(key, x, y) => patchNode(key, { x, y })}
+          onConnect={connect}
+          onRemoveNode={removeNode}
+          onRemoveEdge={(key) => setEdges((current) => current.filter((edge) => edge.key !== key))}
+          onSelect={setSelected}
+        />
+        <aside className="card space-y-3">
+          {!selectedNode && !selectedEdge && <p className="text-sm text-slate-600">Knoten oder Kante auswählen.</p>}
+          {selectedNode && (
+            <>
+              <h2 className="font-semibold">{selectedNode.is_functional ? "Endprodukt" : TYPE_LABEL[selectedNode.type]}</h2>
+              <label className="block text-sm">
+                Name
+                <input className="input mt-1" value={selectedNode.name} onChange={(e) => patchNode(selectedNode.key, { name: e.target.value })} />
+              </label>
+              {selectedNode.type === "category" && (
+                <>
+                  <label className="block text-sm">
+                    Kategorie
+                    <select
+                      className="input mt-1"
+                      value={selectedNode.role_id || ""}
+                      onChange={(e) => {
+                        const roleId = Number(e.target.value);
+                        const nextRole = roles.find((item) => item.id === roleId);
+                        const previousRole = roles.find((item) => item.id === selectedNode.role_id);
+                        const stillGeneric =
+                          !selectedNode.name ||
+                          selectedNode.name === TYPE_LABEL.category ||
+                          selectedNode.name === previousRole?.label;
+                        patchNode(selectedNode.key, {
+                          role_id: roleId,
+                          name: stillGeneric && nextRole ? nextRole.label : selectedNode.name,
+                        });
+                      }}
+                    >
+                      {roles.map((role) => (
+                        <option key={role.id} value={role.id}>
+                          {role.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={selectedNode.datasets_differ}
+                      onChange={(e) =>
+                        patchNode(selectedNode.key, {
+                          datasets_differ: e.target.checked,
+                          optional: e.target.checked ? false : selectedNode.optional,
+                        })
+                      }
+                    />
+                    Datensätze verhalten sich unterschiedlich
+                  </label>
+                </>
+              )}
+              {(selectedNode.type === "transport" || selectedNode.type === "recovery") && (
+                <label className="block text-sm">
+                  Datensatz
+                  <select
+                    className="input mt-1"
+                    value={selectedNode.dataset_id || ""}
+                    onChange={(e) =>
+                      patchNode(selectedNode.key, { dataset_id: e.target.value ? Number(e.target.value) : null })
+                    }
+                  >
+                    <option value="">Bitte wählen</option>
+                    {datasets
+                      .filter((item) => !selectedNode.role_id || item.role_ids.includes(selectedNode.role_id))
+                      .map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name}
+                          {item.location ? ` (${item.location})` : ""}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              )}
+              {selectedNode.type === "category" ? (
+                <div className="block text-sm">
+                  Einheit
+                  <p className="mt-1">{unitPreview(selectedNode)}</p>
+                  {unitWarnings(selectedNode).map((warning) => (
+                    <p key={warning} className="mt-1 text-xs text-red-700">
+                      {warning}
+                    </p>
+                  ))}
+                </div>
+              ) : (
+                <label className="block text-sm">
+                  Einheit
+                  <input className="input mt-1" value={selectedNode.unit} onChange={(e) => patchNode(selectedNode.key, { unit: e.target.value })} />
+                </label>
+              )}
+              {selectedNode.type === "transport" && (
+                <label className="block text-sm">
+                  Distanz (km)
+                  <input
+                    className="input mt-1"
+                    type="number"
+                    step="any"
+                    value={selectedNode.distance_km ?? ""}
+                    onChange={(e) => patchNode(selectedNode.key, { distance_km: Number(e.target.value) })}
+                  />
+                </label>
+              )}
+              {(selectedNode.type === "transport" ||
+                (selectedNode.type === "category" && !selectedNode.datasets_differ)) && (
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.optional}
+                    onChange={(e) => patchNode(selectedNode.key, { optional: e.target.checked })}
+                  />
+                  optional, standardmäßig aus
+                </label>
+              )}
+              {selectedNode.type === "process" && (
+                <div className="space-y-3 border-t pt-3">
+                  <h3 className="font-semibold">Kombinationen</h3>
+                  {categories
+                    .filter((category) =>
+                      edges.some((edge) => edge.source === category.key && edge.target === selectedNode.key && edge.kind !== "waste"),
+                    )
+                    .map((category) => {
+                      const rows = shares.filter((share) => share.category_key === category.key);
+                      if (rows.length < 2) return null;
+                      return (
+                        <div key={category.key} className="space-y-1">
+                          <p className="text-xs font-medium">Anteile {categoryTitle(category, roles)}</p>
+                          {rows.map((share) => {
+                            const dataset = datasets.find((item) => item.id === share.dataset_id);
+                            return (
+                              <label key={share.dataset_id} className="block text-xs">
+                                {dataset?.name || "Datensatz"}
+                                <input
+                                  className="input"
+                                  type="number"
+                                  step="any"
+                                  value={share.default_share}
+                                  onChange={(e) => patchShare(category.key, share.dataset_id, Number(e.target.value))}
+                                />
+                              </label>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+                  {processCombinations.length === 0 && (
+                    <p className="text-xs text-slate-500">Kategorien mit dem Prozess verbinden. Ungleiche Kategorien brauchen Datensätze.</p>
+                  )}
+                  <div className="space-y-3">
+                    {processCombinations.map((combo) => (
+                      <div key={combo.key} className="space-y-2 rounded-lg bg-slate-50 p-3">
+                        <p className="text-sm font-medium">
+                          {combo.axes.length
+                            ? combo.axes
+                                .map((axis) => datasets.find((item) => item.id === axis.dataset_id)?.name || "Datensatz")
+                                .join(" × ")
+                            : "eine Rezeptur"}
+                        </p>
+                        {combo.amounts.map((amount) => {
+                          const category = nodes.find((node) => node.key === amount.category_key);
+                          const productUnit =
+                            nodes.find(
+                              (node) =>
+                                node.type === "product" &&
+                                edges.some(
+                                  (edge) =>
+                                    edge.source === selectedNode.key &&
+                                    edge.target === node.key &&
+                                    edge.kind === "material",
+                                ),
+                            )?.unit ||
+                            chain?.end_unit ||
+                            "";
+                          const material = edges.some(
+                            (edge) =>
+                              edge.source === amount.category_key &&
+                              edge.target === selectedNode.key &&
+                              edge.kind === "material",
+                          );
+                          const waste = Math.max(0, Math.round((amount.input_amount - 1) * 1000) / 1000);
+                          const efficiency = amount.input_amount > 0 ? Math.round((1 / amount.input_amount) * 100) : 0;
+                          return (
+                            <div key={amount.category_key} className="space-y-1">
+                              <label className="block text-xs">
+                                {category ? categoryTitle(category, roles) : "Kategorie"}
+                                {category ? ` (${unitPreview(category)} je 1 ${productUnit})` : ""}
+                                <input
+                                  className="input"
+                                  type="number"
+                                  step="any"
+                                  min={0}
+                                  value={amount.input_amount}
+                                  onChange={(e) =>
+                                    patchAmount(combo.key, amount.category_key, { input_amount: Number(e.target.value) })
+                                  }
+                                />
+                              </label>
+                              {category &&
+                                unitWarnings(category).map((warning) => (
+                                  <p key={warning} className="text-xs text-red-700">
+                                    {warning}
+                                  </p>
+                                ))}
+                              {material && (
+                                <p className="text-xs text-slate-500">
+                                  Effizienz {efficiency} % · Abfall {formatQuantity(waste)}
+                                </p>
+                              )}
+                              {material && waste > 0 && (
+                                <select
+                                  className="input"
+                                  value={amount.recovery_key || ""}
+                                  onChange={(e) =>
+                                    patchAmount(combo.key, amount.category_key, { recovery_key: e.target.value || null })
+                                  }
+                                >
+                                  <option value="">Verwertung</option>
+                                  {recoveries.map((node) => (
+                                    <option key={node.key} value={node.key}>
+                                      {node.name}
+                                    </option>
+                                  ))}
+                                </select>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {!selectedNode.is_functional && (
+                <button className="text-sm text-red-700 underline" type="button" onClick={() => removeNode(selectedNode.key)}>
+                  Knoten entfernen
+                </button>
+              )}
+            </>
+          )}
+          {selectedEdge && (
+            <>
+              <h2 className="font-semibold">Kante</h2>
+              <label className="block text-sm">
+                Art
+                <select
+                  className="input mt-1"
+                  value={selectedEdge.kind}
+                  onChange={(e) => patchEdge(selectedEdge.key, { kind: e.target.value as EdgeKind })}
+                >
+                  <option value="material">Material</option>
+                  <option value="energy">Energie</option>
+                  <option value="waste">Abfall</option>
+                </select>
+              </label>
+              {nodes.find((node) => node.key === selectedEdge.source)?.type === "category" && (
+                <p className="text-sm text-slate-600">Die Menge steht in den Kombinationen des Prozesses.</p>
+              )}
+              {nodes.find((node) => node.key === selectedEdge.source)?.type === "process" && (
+                <p className="text-sm text-slate-600">Der Prozess erzeugt eine Einheit des Folgeprodukts.</p>
+              )}
+              {selectedEdge.kind === "material" &&
+                nodes.find((node) => node.key === selectedEdge.source)?.type === "product" &&
+                nodes.find((node) => node.key === selectedEdge.target)?.type === "process" && (
+                  <label className="block text-sm">
+                    Menge je Einheit Ziel
+                    <input
+                      className="input mt-1"
+                      type="number"
+                      step="any"
+                      min={0}
+                      value={selectedEdge.input_amount}
+                      onChange={(e) => patchEdge(selectedEdge.key, { input_amount: Number(e.target.value) })}
+                    />
+                    <span className="mt-1 block text-xs text-slate-500">
+                      Effizienz {selectedEdge.input_amount > 0 ? Math.round((1 / selectedEdge.input_amount) * 100) : 0} % · Abfall{" "}
+                      {formatQuantity(Math.max(0, selectedEdge.input_amount - 1))}
+                    </span>
+                  </label>
+                )}
+              <button
+                className="text-sm text-red-700 underline"
+                type="button"
+                onClick={() => {
+                  setEdges((current) => current.filter((edge) => edge.key !== selectedEdge.key));
+                  setSelected(null);
+                }}
+              >
+                Kante entfernen
+              </button>
+            </>
+          )}
+        </aside>
+      </div>
+      <div className="flex flex-wrap gap-3">
         <button className="btn-secondary" type="button" onClick={() => void save()}>
           Entwurf speichern
         </button>

@@ -9,6 +9,7 @@ __pycache__/
 .ruff_cache/
 .env
 backend/.env
+docker-compose.override.yml
 node_modules/
 frontend/dist/
 frontend/node_modules/

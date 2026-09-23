@@ -6,7 +6,6 @@ import type {
   Configuration,
   Dataset,
   EndProduct,
-  ExtraSlot,
   Indicator,
   Role,
   User,
@@ -75,12 +74,18 @@ export const AdminApi = {
   users: () => api<User[]>("/api/users"),
   setRole: (userId: number, role: string) =>
     api<User>(`/api/users/${userId}`, { method: "PATCH", body: JSON.stringify({ role }) }),
+  updateCatalogDataset: (id: number, role_ids: number[]) =>
+    api<Dataset>(`/api/catalog/datasets/${id}`, { method: "PATCH", body: JSON.stringify({ role_ids }) }),
+  deleteCatalogDataset: (id: number) => api(`/api/catalog/datasets/${id}`, { method: "DELETE" }),
 };
 
 export const DataApi = {
   roles: () => api<Role[]>("/api/roles"),
   createRole: (label: string) =>
     api<Role>("/api/roles", { method: "POST", body: JSON.stringify({ label }) }),
+  updateRole: (id: number, label: string) =>
+    api<Role>(`/api/roles/${id}`, { method: "PATCH", body: JSON.stringify({ label }) }),
+  deleteRole: (id: number) => api(`/api/roles/${id}`, { method: "DELETE" }),
   endProducts: () => api<EndProduct[]>("/api/end-products"),
   createEndProduct: (name: string, unit: string) =>
     api<EndProduct>("/api/end-products", { method: "POST", body: JSON.stringify({ name, unit }) }),
@@ -136,11 +141,11 @@ export async function download(path: string, body: unknown, filename: string) {
 export function defaultPayload(chain: Chain): CalculatePayload {
   const selections: Record<string, number> = {};
   const shares: Record<string, number> = {};
-  chain.stages.forEach((stage) => {
-    stage.slots.forEach((slot) => {
-      if (slot.default_dataset_id) selections[String(slot.id)] = slot.default_dataset_id;
-      shares[String(slot.id)] = slot.default_share;
-    });
+  chain.nodes.forEach((node) => {
+    if (node.dataset_id) selections[String(node.id)] = node.dataset_id;
+  });
+  chain.dataset_shares.forEach((share) => {
+    shares[`${share.category_node_id}:${share.dataset_id}`] = share.default_share;
   });
   return {
     chain_id: chain.id,
@@ -148,7 +153,6 @@ export function defaultPayload(chain: Chain): CalculatePayload {
     selections,
     shares,
     optional_on: [],
-    extra_slots: [] as ExtraSlot[],
-    replaced_stages: {},
+    replaced_nodes: {},
   };
 }

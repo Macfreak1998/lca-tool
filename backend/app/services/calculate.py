@@ -4,20 +4,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from app.constants import CLIMATE_CHANGE, INDICATOR_IDS, SOURCE_USER
-from app.models import Chain, Dataset, Role, Stage
+from app.models import Chain, ChainEdge, ChainNode, Dataset, Role
 from app.services.characterize import apply_lcia, try_load_method
+from app.services.units import same_unit, unit_mismatch_message
 
 MODE_LCIA = "lcia"
 MODE_INVENTORY = "inventory"
-
-
-@dataclass
-class ExtraSlot:
-    key: str
-    stage_id: int
-    role_id: int
-    dataset_id: int | None
-    share: float = 0.0
 
 
 @dataclass
@@ -26,17 +18,16 @@ class CalcInput:
     selections: dict[str, int] = field(default_factory=dict)
     shares: dict[str, float] = field(default_factory=dict)
     optional_on: list[int] = field(default_factory=list)
-    extra_slots: list[ExtraSlot] = field(default_factory=list)
-    replaced_stages: dict[int, int] = field(default_factory=dict)
+    replaced_nodes: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
 class Contribution:
-    stage_id: int
-    stage_name: str
+    node_id: int
+    node_name: str
     role_id: int
     role_label: str
-    slot_key: str
+    use_key: str
     dataset_id: int
     dataset_name: str
     amount: float
@@ -60,7 +51,7 @@ class InventoryLine:
     compartment: str
     subcompartment: str
     unit: str
-    stage_name: str
+    node_name: str
     role_label: str
     dataset_name: str
     value: float
@@ -77,82 +68,146 @@ class CalcResult:
 
 
 @dataclass
-class _SlotUse:
-    stage: Stage
+class _Use:
+    node_id: int
+    node_name: str
     role_id: int
-    slot_key: str
+    role_label: str
+    use_key: str
     dataset: Dataset
     amount: float
     unit: str
 
 
-def ordered_stages(chain: Chain) -> list[Stage]:
-    stages = list(chain.stages)
-    stages.sort(key=lambda item: item.sort_order)
-    return stages
+@dataclass
+class _ProductLink:
+    upstream_id: int
+    downstream_id: int
+    input_amount: float
 
 
-def terminal_stage(stages: list[Stage]) -> Stage | None:
-    if not stages:
-        return None
-    terminals = [stage for stage in stages if stage.outgoing_stage_id is None]
-    for stage in reversed(stages):
-        if stage.outgoing_stage_id is None:
-            return stage
-    return terminals[-1] if terminals else stages[-1]
+def _role_label(role: Role | None, role_id: int, fallback: str = "") -> str:
+    if role:
+        return role.label
+    if fallback:
+        return fallback
+    if role_id:
+        return f"Kategorie {role_id}"
+    return "Knoten"
 
 
-def walk_backward(stages: list[Stage]) -> list[Stage]:
-    if not stages:
-        return []
-    incoming: dict[int | None, list[Stage]] = defaultdict(list)
-    for stage in stages:
-        incoming[stage.outgoing_stage_id].append(stage)
-    start = terminal_stage(stages)
-    if start is None:
-        return []
-    order: list[Stage] = []
-    seen: set[int] = set()
-
-    def visit(stage: Stage) -> None:
-        if stage.id in seen:
-            return
-        seen.add(stage.id)
-        order.append(stage)
-        for prev in incoming.get(stage.id, []):
-            visit(prev)
-
-    visit(start)
-    for stage in stages:
-        if stage.id not in seen:
-            order.append(stage)
-    return order
-
-
-def _slot_key(slot_id: int) -> str:
-    return str(slot_id)
-
-
-def _is_optional(slot) -> bool:  # type: ignore[no-untyped-def]
-    return (not slot.required) or slot.optional_default_off
-
-
-def _slot_active(slot, optional_on: set[int]) -> bool:  # type: ignore[no-untyped-def]
-    if _is_optional(slot):
-        return slot.id in optional_on
-    return True
+def _empty_result(blockers: list[str]) -> CalcResult:
+    return CalcResult({}, [], blockers)
 
 
 def _dataset_factors(dataset: Dataset) -> dict[str, float | None]:
     return {row.indicator_id: row.value for row in dataset.factors}
 
 
-def _role_label(role: Role | None, role_id: int) -> str:
-    return role.label if role else f"Kategorie {role_id}"
+def has_cycle(nodes: list[ChainNode], edges: list[ChainEdge]) -> bool:
+    adjacency: dict[int, list[int]] = defaultdict(list)
+    for edge in edges:
+        adjacency[edge.source_id].append(edge.target_id)
+    color = {node.id: 0 for node in nodes}
+
+    def visit(node_id: int) -> bool:
+        color[node_id] = 1
+        for nxt in adjacency.get(node_id, []):
+            state = color.get(nxt, 0)
+            if state == 1 or (state == 0 and visit(nxt)):
+                return True
+        color[node_id] = 2
+        return False
+
+    return any(state == 0 and visit(node_id) for node_id, state in color.items())
 
 
-def _empty_result(blockers: list[str]) -> CalcResult:
-    return CalcResult({}, [], blockers)
+def functional_node(nodes: list[ChainNode]) -> ChainNode | None:
+    found = [node for node in nodes if node.is_functional]
+    return found[0] if len(found) == 1 else None
+
+
+def _flow_source(
+    nodes: dict[int, ChainNode], incoming: dict[int, list[ChainEdge]], node_id: int
+) -> ChainNode | None:
+    node = nodes.get(node_id)
+    if node is None or node.type != "transport":
+        return node
+    for hop in incoming.get(node_id, []):
+        upstream = nodes.get(hop.source_id)
+        if upstream and upstream.type in {"product", "process"}:
+            return upstream
+    return None
+
+
+def product_links(nodes: dict[int, ChainNode], edges: list[ChainEdge]) -> list[_ProductLink]:
+    incoming: dict[int, list[ChainEdge]] = defaultdict(list)
+    for edge in edges:
+        if edge.kind == "material":
+            incoming[edge.target_id].append(edge)
+    links: list[_ProductLink] = []
+    for edge in edges:
+        if edge.kind != "material":
+            continue
+        target = nodes.get(edge.target_id)
+        if target is None or target.type not in {"product", "process"}:
+            continue
+        source = _flow_source(nodes, incoming, edge.source_id)
+        if source is None or source.type not in {"product", "process"}:
+            continue
+        if source.type == "process" and target.type == "product":
+            amount = 1.0
+        elif source.type == "product" and target.type == "process":
+            amount = edge.input_amount or 0.0
+        elif source.type == "product" and target.type == "product":
+            amount = edge.input_amount or 0.0
+        else:
+            continue
+        links.append(_ProductLink(source.id, target.id, amount))
+    return links
+
+
+def _ancestors(edges: list[ChainEdge], start_id: int) -> set[int]:
+    incoming: dict[int, list[int]] = defaultdict(list)
+    for edge in edges:
+        incoming[edge.target_id].append(edge.source_id)
+    seen: set[int] = set()
+    stack = list(incoming.get(start_id, []))
+    while stack:
+        node_id = stack.pop()
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        stack.extend(incoming.get(node_id, []))
+    return seen
+
+
+def waste_per_unit(amount: float) -> float:
+    """Rest oberhalb einer Einheit Ziel. Einsatz 1,1 ergibt 0,1 Abfall."""
+    return max(0.0, amount - 1.0)
+
+
+def _waste_target(edges: list[ChainEdge], product_id: int) -> int | None:
+    for edge in edges:
+        if edge.kind == "waste" and edge.source_id == product_id:
+            return edge.target_id
+    return None
+
+
+def share_key(category_id: int, dataset_id: int) -> str:
+    return f"{category_id}:{dataset_id}"
+
+
+def _normalize_share_map(pairs: list[tuple[int, float]]) -> tuple[dict[int, float], str | None]:
+    if not pairs:
+        return {}, "leer"
+    if len(pairs) == 1:
+        return {pairs[0][0]: 1.0}, None
+    share_sum = sum(share for _dataset_id, share in pairs)
+    if abs(share_sum - 1.0) > 1e-6 and abs(share_sum - 100.0) > 1e-6:
+        return {}, "100 %"
+    factor = 100.0 if share_sum > 2 else 1.0
+    return {dataset_id: share / factor for dataset_id, share in pairs}, None
 
 
 def calculate(
@@ -169,165 +224,309 @@ def calculate(
     if payload.end_amount is None or payload.end_amount <= 0:
         blockers.append("Bitte eine Endmenge größer als 0 eingeben.")
 
-    stages = ordered_stages(chain)
-    if not stages:
-        blockers.append("Die Kette hat keine Stufen.")
+    nodes = list(chain.nodes)
+    edges = list(chain.edges)
+    combinations = list(chain.combinations)
+    defaults = {
+        (row.category_node_id, row.dataset_id): row.default_share for row in chain.dataset_shares
+    }
+    if not nodes:
+        blockers.append("Die Kette hat keine Knoten.")
+        return _empty_result(blockers)
+    if has_cycle(nodes, edges):
+        blockers.append("Die Kette enthält einen Zyklus.")
         return _empty_result(blockers)
 
-    skipped_stage_ids = _skipped_upstream(stages, payload.replaced_stages)
+    by_id = {node.id: node for node in nodes}
+    end = functional_node(nodes)
+    if end is None:
+        blockers.append("Die Kette braucht genau ein Endprodukt.")
+        return _empty_result(blockers)
+    if payload.end_amount is None or payload.end_amount <= 0:
+        return _empty_result(blockers)
 
-    extras_by_stage_role: dict[tuple[int, int], list[ExtraSlot]] = defaultdict(list)
-    for extra in payload.extra_slots:
-        extras_by_stage_role[(extra.stage_id, extra.role_id)].append(extra)
+    replaced = {
+        node_id: dataset_id
+        for node_id, dataset_id in payload.replaced_nodes.items()
+        if node_id != end.id and node_id in by_id
+    }
+    skipped: set[int] = set()
+    for node_id in replaced:
+        skipped |= _ancestors(edges, node_id)
+
+    amounts: dict[int, float] = {end.id: payload.end_amount}
+    links = product_links(by_id, edges)
+    upstreams: dict[int, list[_ProductLink]] = defaultdict(list)
+    sched_in: dict[int, int] = defaultdict(int)
+    sched_out: dict[int, list[int]] = defaultdict(list)
+    involved: set[int] = {end.id}
+    for link in links:
+        upstreams[link.downstream_id].append(link)
+        sched_out[link.downstream_id].append(link.upstream_id)
+        sched_in[link.upstream_id] += 1
+        involved.add(link.upstream_id)
+        involved.add(link.downstream_id)
+
+    queue = [node_id for node_id in involved if sched_in[node_id] == 0]
+    while queue:
+        node_id = queue.pop()
+        if node_id not in skipped:
+            demand = amounts.get(node_id)
+            if demand is not None:
+                for link in upstreams.get(node_id, []):
+                    if link.upstream_id in skipped and link.upstream_id not in replaced:
+                        continue
+                    amounts[link.upstream_id] = (
+                        amounts.get(link.upstream_id, 0.0) + demand * link.input_amount
+                    )
+        for nxt in sched_out.get(node_id, []):
+            sched_in[nxt] -= 1
+            if sched_in[nxt] == 0:
+                queue.append(nxt)
 
     optional_on = set(payload.optional_on)
-    uses: list[_SlotUse] = []
+    uses: list[_Use] = []
+    recovery_amounts: dict[int, float] = defaultdict(float)
 
-    amounts: dict[int, float] = {}
-    if payload.end_amount and payload.end_amount > 0:
-        term = terminal_stage(stages)
-        if term:
-            amounts[term.id] = payload.end_amount
-        for stage in walk_backward(stages):
-            if stage.id in skipped_stage_ids:
-                continue
-            ausgang = amounts.get(stage.id)
-            if ausgang is None:
-                continue
-            replaced_id = payload.replaced_stages.get(stage.id)
-            if replaced_id:
-                _collect_blackbox(uses, blockers, stage, ausgang, replaced_id, datasets)
-                continue
-            predecessors = [item for item in stages if item.outgoing_stage_id == stage.id]
-            if predecessors:
-                pred = predecessors[0]
-                if pred.id not in skipped_stage_ids:
-                    amounts[pred.id] = ausgang * (stage.upstream_amount or 1.0)
+    def add_use(
+        node: ChainNode,
+        dataset_id: int | None,
+        amount: float,
+        unit: str,
+        use_key: str,
+        role_id: int = 0,
+        role_fallback: str = "",
+    ) -> None:
+        if amount <= 0:
+            return
+        if dataset_id is None:
+            blockers.append(f"Bitte einen Datensatz wählen ({node.name}).")
+            return
+        dataset = datasets.get(dataset_id)
+        if dataset is None:
+            blockers.append("Ein gewählter Datensatz ist nicht mehr verfügbar.")
+            return
+        if dataset.source_kind == SOURCE_USER:
+            factors = _dataset_factors(dataset)
+            if factors.get(CLIMATE_CHANGE) is None:
+                blockers.append(f"Eigener Datensatz „{dataset.name}“ braucht mindestens CO₂e.")
+                return
+        if node.type == "category" and not same_unit(dataset.unit, unit):
+            message = unit_mismatch_message(dataset.name, dataset.unit, node.name, unit)
+            if message not in blockers:
+                blockers.append(message)
+            return
+        label = role_fallback or _role_label(roles.get(role_id), role_id)
+        uses.append(
+            _Use(
+                node_id=node.id,
+                node_name=node.name,
+                role_id=role_id,
+                role_label=label,
+                use_key=use_key,
+                dataset=dataset,
+                amount=amount,
+                unit=unit,
+            )
+        )
 
-            grouped: dict[int, list] = defaultdict(list)
-            for slot in stage.slots:
-                grouped[slot.role_id].append(slot)
+    for node_id, dataset_id in replaced.items():
+        node = by_id[node_id]
+        add_use(
+            node,
+            dataset_id,
+            amounts.get(node_id, 0.0),
+            node.unit or "kg",
+            f"replace:{node_id}",
+            role_fallback="Ersatz",
+        )
 
-            for role_id, slots in grouped.items():
-                extras = extras_by_stage_role.get((stage.id, role_id), [])
-                active_slots = [slot for slot in slots if _slot_active(slot, optional_on)]
-                if not active_slots and not extras:
-                    if any(not _is_optional(slot) for slot in slots):
-                        blockers.append(
-                            f"Pflichtfeld fehlt: {_role_label(roles.get(role_id), role_id)} in {stage.name}."
-                        )
+    category_kind: dict[tuple[int, int], str] = {}
+    incoming_categories: dict[int, list[ChainNode]] = defaultdict(list)
+    for edge in edges:
+        source = by_id.get(edge.source_id)
+        target = by_id.get(edge.target_id)
+        if source is None or target is None or edge.kind == "waste":
+            continue
+        if source.type == "category" and target.type == "process":
+            category_kind[(target.id, source.id)] = edge.kind
+            incoming_categories[target.id].append(source)
+
+    def share_of(category_id: int, dataset_id: int) -> float:
+        key = share_key(category_id, dataset_id)
+        if key in payload.shares:
+            return payload.shares[key]
+        return defaults.get((category_id, dataset_id), 0.0)
+
+    combos_by_process: dict[int, list] = defaultdict(list)
+    for combo in combinations:
+        combos_by_process[combo.process_node_id].append(combo)
+
+    for process in nodes:
+        if process.type != "process" or process.id in skipped:
+            continue
+        demand = amounts.get(process.id)
+        if demand is None:
+            continue
+        categories = incoming_categories.get(process.id, [])
+        active_categories = []
+        for category in categories:
+            if category.datasets_differ:
+                active_categories.append(category)
+                continue
+            if category.optional and category.id not in optional_on:
+                continue
+            active_categories.append(category)
+        process_combos = combos_by_process.get(process.id, [])
+        if not process_combos and active_categories:
+            blockers.append(f"Kombination fehlt für {process.name}.")
+            continue
+        share_maps: dict[int, dict[int, float]] = {}
+        share_failed = False
+        for category in active_categories:
+            if category.datasets_differ:
+                dataset_ids = sorted(
+                    {
+                        axis.dataset_id
+                        for combo in process_combos
+                        for axis in combo.axes
+                        if axis.category_node_id == category.id and axis.dataset_id is not None
+                    }
+                )
+            else:
+                dataset_ids = sorted(
+                    {
+                        dataset_id
+                        for (category_id, dataset_id) in defaults
+                        if category_id == category.id
+                    }
+                    | {
+                        int(key.split(":", 1)[1])
+                        for key in payload.shares
+                        if key.startswith(f"{category.id}:") and key.split(":", 1)[1].isdigit()
+                    }
+                )
+            if not dataset_ids:
+                if not category.optional:
+                    blockers.append(f"Datensatz fehlt für {category.name}.")
+                    share_failed = True
+                continue
+            scaled, share_error = _normalize_share_map(
+                [(dataset_id, share_of(category.id, dataset_id)) for dataset_id in dataset_ids]
+            )
+            if share_error:
+                blockers.append(f"Anteile für {category.name} müssen 100 % ergeben.")
+                share_failed = True
+                continue
+            share_maps[category.id] = scaled
+        if share_failed:
+            continue
+        for combo in process_combos:
+            axis = {
+                item.category_node_id: item.dataset_id
+                for item in combo.axes
+                if item.dataset_id is not None
+            }
+            weight = 1.0
+            for category_id, dataset_id in axis.items():
+                weight *= share_maps.get(category_id, {}).get(dataset_id, 0.0)
+            if weight <= 1e-12:
+                continue
+            for amount in combo.amounts:
+                category = by_id.get(amount.category_node_id)
+                if category is None or category.id not in share_maps:
                     continue
-
-                specific = active_slots[0].specific_amount if active_slots else slots[0].specific_amount
-                unit = active_slots[0].unit if active_slots else slots[0].unit
-                members: list[tuple[str, int | None, float]] = []
-                for slot in active_slots:
-                    dataset_id = payload.selections.get(_slot_key(slot.id))
-                    if dataset_id is None and slot.default_dataset_id:
-                        dataset_id = slot.default_dataset_id
-                    share = payload.shares.get(_slot_key(slot.id), slot.default_share)
-                    members.append((_slot_key(slot.id), dataset_id, share))
-                for extra in extras:
-                    members.append((extra.key, extra.dataset_id, extra.share))
-
-                if len(members) > 1:
-                    share_sum = sum(item[2] for item in members)
-                    if abs(share_sum - 1.0) > 1e-6 and abs(share_sum - 100.0) > 1e-6:
-                        blockers.append(
-                            f"Anteile für {_role_label(roles.get(role_id), role_id)} in {stage.name} müssen 100 % ergeben."
-                        )
-                    share_factor = 100.0 if share_sum > 2 else 1.0
+                kind = category_kind.get((process.id, category.id), "material")
+                unit = category.unit
+                if category.datasets_differ:
+                    portions = [(axis.get(category.id), 1.0)]
                 else:
-                    share_factor = 1.0
-                    members = [(members[0][0], members[0][1], 1.0)] if members else members
-
-                for slot_key, dataset_id, share in members:
-                    if dataset_id is None:
-                        blockers.append(
-                            f"Bitte einen Datensatz wählen ({_role_label(roles.get(role_id), role_id)}, {stage.name})."
-                        )
-                        continue
-                    dataset = datasets.get(dataset_id)
-                    if dataset is None:
-                        blockers.append("Ein gewählter Datensatz ist nicht mehr verfügbar.")
-                        continue
-                    if dataset.source_kind == SOURCE_USER:
-                        factors = _dataset_factors(dataset)
-                        if factors.get(CLIMATE_CHANGE) is None:
-                            blockers.append(f"Eigener Datensatz „{dataset.name}“ braucht mindestens CO₂e.")
-                            continue
-                    raw_share = share / share_factor if share_factor == 100.0 else share
-                    if len(members) == 1:
-                        raw_share = 1.0
-                    menge = ausgang * specific * raw_share
-                    uses.append(
-                        _SlotUse(
-                            stage=stage,
-                            role_id=role_id,
-                            slot_key=slot_key,
-                            dataset=dataset,
-                            amount=menge,
-                            unit=unit,
-                        )
+                    portions = list(share_maps[category.id].items())
+                for dataset_id, portion in portions:
+                    qty = demand * amount.input_amount * weight * portion
+                    add_use(
+                        category,
+                        dataset_id,
+                        qty,
+                        unit,
+                        f"combo:{combo.id}:{category.id}:{dataset_id}",
+                        role_id=category.role_id or 0,
                     )
+                if kind != "material":
+                    continue
+                waste_qty = demand * waste_per_unit(amount.input_amount) * weight
+                if waste_qty <= 1e-12:
+                    continue
+                if amount.recovery_node_id is None:
+                    blockers.append(f"Verwertung fehlt für Abfall an {process.name}.")
+                else:
+                    recovery_amounts[amount.recovery_node_id] += waste_qty
+
+    for link in links:
+        downstream = by_id.get(link.downstream_id)
+        if downstream is None or downstream.id in replaced or downstream.id in skipped:
+            continue
+        demand = amounts.get(downstream.id)
+        if demand is None:
+            continue
+        waste_qty = demand * waste_per_unit(link.input_amount)
+        if waste_qty <= 1e-12:
+            continue
+        recovery_id = _waste_target(edges, downstream.id)
+        if recovery_id is None:
+            blockers.append(f"Verwertung fehlt für Abfall an {downstream.name}.")
+        else:
+            recovery_amounts[recovery_id] += waste_qty
+
+    for node_id, qty in recovery_amounts.items():
+        node = by_id.get(node_id)
+        if node is None:
+            continue
+        add_use(
+            node,
+            node.dataset_id,
+            qty,
+            node.unit or "kg",
+            f"recovery:{node.id}",
+            role_fallback="Verwertung",
+        )
+
+    transport_mass: dict[int, float] = defaultdict(float)
+    for edge in edges:
+        if edge.kind != "material":
+            continue
+        source = by_id.get(edge.source_id)
+        target = by_id.get(edge.target_id)
+        if source is None or target is None:
+            continue
+        if source.type == "transport" and target.type in {"product", "process"} and target.id not in skipped:
+            if source.optional and source.id not in optional_on:
+                continue
+            demand = amounts.get(target.id)
+            if demand is None:
+                continue
+            transport_mass[source.id] += demand * (edge.input_amount or 0.0)
+
+    for node_id, mass in transport_mass.items():
+        node = by_id[node_id]
+        distance = node.distance_km or 0.0
+        add_use(
+            node,
+            node.dataset_id,
+            mass * distance,
+            node.unit or "kg·km",
+            f"transport:{node.id}",
+            role_fallback="Transport",
+        )
 
     if blockers:
         return _empty_result(blockers)
     return _finish(uses, roles)
 
 
-def _skipped_upstream(stages: list[Stage], replaced: dict[int, int]) -> set[int]:
-    skipped: set[int] = set()
-    by_outgoing: dict[int, list[Stage]] = defaultdict(list)
-    for stage in stages:
-        if stage.outgoing_stage_id:
-            by_outgoing[stage.outgoing_stage_id].append(stage)
-
-    def walk_prev(stage_id: int) -> None:
-        for prev in by_outgoing.get(stage_id, []):
-            skipped.add(prev.id)
-            walk_prev(prev.id)
-
-    for stage_id in replaced:
-        walk_prev(stage_id)
-    return skipped
-
-
-def _collect_blackbox(
-    uses: list[_SlotUse],
-    blockers: list[str],
-    stage: Stage,
-    amount: float,
-    dataset_id: int,
-    datasets: dict[int, Dataset],
-) -> None:
-    dataset = datasets.get(dataset_id)
-    if dataset is None:
-        blockers.append(f"Ersatzdatensatz für Stufe „{stage.name}“ fehlt.")
-        return
-    if dataset.source_kind != SOURCE_USER:
-        blockers.append("Eine Zwischenstufe darf nur durch einen eigenen Datensatz ersetzt werden.")
-        return
-    factors = _dataset_factors(dataset)
-    if factors.get(CLIMATE_CHANGE) is None:
-        blockers.append(f"Eigener Datensatz „{dataset.name}“ braucht mindestens CO₂e.")
-        return
-    role_id = dataset.roles[0].role_id if dataset.roles else 0
-    uses.append(
-        _SlotUse(
-            stage=stage,
-            role_id=role_id,
-            slot_key=f"stage:{stage.id}",
-            dataset=dataset,
-            amount=amount,
-            unit=dataset.unit,
-        )
-    )
-
-
-def _finish(uses: list[_SlotUse], roles: dict[int, Role]) -> CalcResult:
+def _finish(uses: list[_Use], roles: dict[int, Role]) -> CalcResult:
     inventory_lines: list[InventoryLine] = []
-    factor_uses: list[_SlotUse] = []
+    factor_uses: list[_Use] = []
     catalog_ids: set[int] = set()
     user_ids: set[int] = set()
 
@@ -339,7 +538,6 @@ def _finish(uses: list[_SlotUse], roles: dict[int, Role]) -> CalcResult:
         catalog_ids.add(use.dataset.id)
         exchanges = list(use.dataset.exchanges)
         if exchanges:
-            role_label = _role_label(roles.get(use.role_id), use.role_id)
             for exchange in exchanges:
                 inventory_lines.append(
                     InventoryLine(
@@ -348,8 +546,8 @@ def _finish(uses: list[_SlotUse], roles: dict[int, Role]) -> CalcResult:
                         compartment=exchange.compartment,
                         subcompartment=exchange.subcompartment,
                         unit=exchange.unit,
-                        stage_name=use.stage.name,
-                        role_label=role_label,
+                        node_name=use.node_name,
+                        role_label=use.role_label or _role_label(roles.get(use.role_id), use.role_id),
                         dataset_name=use.dataset.name,
                         value=use.amount * exchange.amount,
                     )
@@ -397,7 +595,7 @@ def _finish(uses: list[_SlotUse], roles: dict[int, Role]) -> CalcResult:
     if inventory_lines:
         return CalcResult(
             totals={},
-            contributions=_slot_quantity_contributions(uses, roles),
+            contributions=_quantity_contributions(uses, roles),
             blockers=[],
             mode=MODE_INVENTORY,
             inventory_summary=summary,
@@ -414,29 +612,28 @@ def _finish(uses: list[_SlotUse], roles: dict[int, Role]) -> CalcResult:
     )
 
 
-def _slot_quantity_contributions(uses: list[_SlotUse], roles: dict[int, Role]) -> list[Contribution]:
-    rows: list[Contribution] = []
-    for use in uses:
-        rows.append(
-            Contribution(
-                stage_id=use.stage.id,
-                stage_name=use.stage.name,
-                role_id=use.role_id,
-                role_label=_role_label(roles.get(use.role_id), use.role_id),
-                slot_key=use.slot_key,
-                dataset_id=use.dataset.id,
-                dataset_name=use.dataset.name,
-                amount=use.amount,
-                unit=use.unit,
-                indicator_id="",
-                value=use.amount,
-            )
-        )
-    return rows
+def _contribution(use: _Use, roles: dict[int, Role], indicator_id: str, value: float) -> Contribution:
+    return Contribution(
+        node_id=use.node_id,
+        node_name=use.node_name,
+        role_id=use.role_id,
+        role_label=use.role_label or _role_label(roles.get(use.role_id), use.role_id),
+        use_key=use.use_key,
+        dataset_id=use.dataset.id,
+        dataset_name=use.dataset.name,
+        amount=use.amount,
+        unit=use.unit,
+        indicator_id=indicator_id,
+        value=value,
+    )
+
+
+def _quantity_contributions(uses: list[_Use], roles: dict[int, Role]) -> list[Contribution]:
+    return [_contribution(use, roles, "", use.amount) for use in uses]
 
 
 def _inventory_lcia_contributions(
-    uses: list[_SlotUse],
+    uses: list[_Use],
     roles: dict[int, Role],
     mapping: dict[str, dict[str, float]],
 ) -> list[Contribution]:
@@ -456,28 +653,14 @@ def _inventory_lcia_contributions(
             raw = slot_totals.get(indicator_id)
             if raw is None:
                 continue
-            rows.append(
-                Contribution(
-                    stage_id=use.stage.id,
-                    stage_name=use.stage.name,
-                    role_id=use.role_id,
-                    role_label=_role_label(roles.get(use.role_id), use.role_id),
-                    slot_key=use.slot_key,
-                    dataset_id=use.dataset.id,
-                    dataset_name=use.dataset.name,
-                    amount=use.amount,
-                    unit=use.unit,
-                    indicator_id=indicator_id,
-                    value=raw,
-                )
-            )
+            rows.append(_contribution(use, roles, indicator_id, raw))
     return rows
 
 
 def _add_factor_contributions(
     contributions: list[Contribution],
     totals: dict[str, float],
-    use: _SlotUse,
+    use: _Use,
     roles: dict[int, Role],
 ) -> None:
     factors = _dataset_factors(use.dataset)
@@ -487,18 +670,4 @@ def _add_factor_contributions(
             continue
         value = use.amount * raw
         totals[indicator_id] = totals.get(indicator_id, 0.0) + value
-        contributions.append(
-            Contribution(
-                stage_id=use.stage.id,
-                stage_name=use.stage.name,
-                role_id=use.role_id,
-                role_label=_role_label(roles.get(use.role_id), use.role_id),
-                slot_key=use.slot_key,
-                dataset_id=use.dataset.id,
-                dataset_name=use.dataset.name,
-                amount=use.amount,
-                unit=use.unit,
-                indicator_id=indicator_id,
-                value=value,
-            )
-        )
+        contributions.append(_contribution(use, roles, indicator_id, value))

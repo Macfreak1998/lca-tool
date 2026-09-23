@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { DataApi, download } from "../api";
 import { MetaApi } from "../api";
-import type { CalcResult, Configuration, Indicator } from "../types";
+import { ChainGraph, type GraphEdge, type GraphNode } from "../components/ChainGraph";
+import type { CalcResult, Chain, Configuration, Indicator } from "../types";
 
 export function ComparePage() {
   const [rows, setRows] = useState<Configuration[]>([]);
@@ -10,6 +11,7 @@ export function ComparePage() {
   const [items, setItems] = useState<{ configuration: Configuration; result: CalcResult }[]>([]);
   const [blockers, setBlockers] = useState<string[]>([]);
   const [error, setError] = useState("");
+  const [graphChain, setGraphChain] = useState<Chain | null>(null);
 
   useEffect(() => {
     void Promise.all([DataApi.configurations(), MetaApi.indicators()]).then(([c, i]) => {
@@ -32,6 +34,9 @@ export function ComparePage() {
       const data = await DataApi.compare(selected);
       setItems(data.items);
       setBlockers(data.blockers);
+      const chainIds = [...new Set(data.items.map((item) => item.configuration.chain_id))];
+      if (chainIds.length === 1) setGraphChain(await DataApi.chain(chainIds[0]));
+      else setGraphChain(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Vergleich fehlgeschlagen.");
     }
@@ -75,6 +80,35 @@ export function ComparePage() {
           </button>
         </div>
       </div>
+      {graphChain && (
+        <div className="space-y-2">
+          <h2 className="font-semibold">{graphChain.name}</h2>
+          <ChainGraph
+            readOnly
+            nodes={graphChain.nodes.map(
+              (node): GraphNode => ({
+                key: String(node.id),
+                type: node.type,
+                name: node.name,
+                x: node.position_x,
+                y: node.position_y,
+                is_functional: node.is_functional,
+                optional: node.optional,
+              }),
+            )}
+            edges={graphChain.edges.map(
+              (edge): GraphEdge => ({
+                key: String(edge.id),
+                source: String(edge.source_id),
+                target: String(edge.target_id),
+                kind: edge.kind,
+                input_amount: edge.input_amount,
+                efficiency: edge.efficiency,
+              }),
+            )}
+          />
+        </div>
+      )}
       {error && <p className="text-sm text-red-700">{error}</p>}
       {blockers.length > 0 && (
         <ul className="card text-sm text-red-700">

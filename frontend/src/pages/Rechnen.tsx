@@ -1,21 +1,47 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { DataApi, MetaApi, defaultPayload, download } from "../api";
-import type {
-  CalcResult,
-  CalculatePayload,
-  Chain,
-  Dataset,
-  EndProduct,
-  Slot,
-  Indicator,
-  Role,
-} from "../types";
+import { ChainGraph, type GraphEdge, type GraphNode } from "../components/ChainGraph";
+import type { CalcResult, CalculatePayload, Chain, Dataset, EndProduct, Indicator, Role } from "../types";
 
-function sourceLabel(kind: string) {
-  if (kind === "ecoinvent") return "ecoinvent";
-  if (kind === "catalog_manual") return "Katalog";
-  return "eigen";
+function asGraph(chain: Chain): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  return {
+    nodes: chain.nodes.map((node) => ({
+      key: String(node.id),
+      type: node.type,
+      name: node.name,
+      x: node.position_x,
+      y: node.position_y,
+      is_functional: node.is_functional,
+      optional: node.optional,
+    })),
+    edges: chain.edges.map((edge) => ({
+      key: String(edge.id),
+      source: String(edge.source_id),
+      target: String(edge.target_id),
+      kind: edge.kind,
+      input_amount: edge.input_amount,
+      efficiency: edge.efficiency,
+    })),
+  };
+}
+
+function skippedNodes(chain: Chain, replaced: Record<string, number>) {
+  const incoming = new Map<number, number[]>();
+  chain.edges.forEach((edge) => {
+    const list = incoming.get(edge.target_id) || [];
+    list.push(edge.source_id);
+    incoming.set(edge.target_id, list);
+  });
+  const seen = new Set<number>();
+  const stack = Object.keys(replaced).flatMap((id) => incoming.get(Number(id)) || []);
+  while (stack.length) {
+    const id = stack.pop() as number;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    stack.push(...(incoming.get(id) || []));
+  }
+  return seen;
 }
 
 export function RechnenPage() {
@@ -66,8 +92,8 @@ export function RechnenPage() {
     });
   }, []);
 
-  function optionsFor(roleId: number) {
-    return [...catalog.filter((item) => item.role_ids.includes(roleId)), ...own.filter((item) => item.role_ids.includes(roleId))];
+  function optionsFor(roleId: number | null) {
+    return [...catalog, ...own].filter((item) => roleId == null || item.role_ids.includes(roleId));
   }
 
   function pickChain(id: number) {
@@ -94,35 +120,14 @@ export function RechnenPage() {
     await DataApi.saveConfiguration({ name: saveName, ...payload });
   }
 
-  const leafStages = useMemo(() => {
-    if (!chain) return [];
-    const skipped = new Set<number>();
-    const incoming: Record<number, number[]> = {};
-    chain.stages.forEach((stage) => {
-      if (stage.outgoing_stage_id) {
-        incoming[stage.outgoing_stage_id] = incoming[stage.outgoing_stage_id] || [];
-        incoming[stage.outgoing_stage_id].push(stage.id);
-      }
-    });
-    function walk(id: number) {
-      (incoming[id] || []).forEach((prev) => {
-        skipped.add(prev);
-        walk(prev);
-      });
-    }
-    Object.keys(payload?.replaced_stages || {}).forEach((id) => walk(Number(id)));
-    return [...chain.stages].sort((a, b) => b.sort_order - a.sort_order).filter((stage) => !skipped.has(stage.id));
-  }, [chain, payload]);
-
-  if (!products.length) {
-    return <p>Noch kein veröffentlichtes Endprodukt. Die Administration muss zuerst eine Kette anlegen.</p>;
-  }
+  const skipped = useMemo(() => (chain && payload ? skippedNodes(chain, payload.replaced_nodes) : new Set<number>()), [chain, payload]);
+  const graph = chain ? asGraph(chain) : null;
 
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold text-forest-800">Rechnung</h1>
-        <p className="text-sm text-slate-600">Zuerst Endprodukt, dann Kette, dann nur die Blätter. Faktoren erscheinen erst nach der Rechnung.</p>
+        <h1 className="text-2xl font-semibold text-forest-800">Rechnen</h1>
+        <p className="text-sm text-slate-600">Endprodukt, Kette und Menge wählen. Anteile je Kategorie bestimmen die gewichtete Rezeptur.</p>
       </div>
       <div className="card grid gap-4 md:grid-cols-3">
         <div>
@@ -135,11 +140,15 @@ export function RechnenPage() {
               setProductId(id);
               const next = chains.find((item) => item.end_product_id === id && item.status === "published");
               if (next) pickChain(next.id);
+              else {
+                setChain(null);
+                setPayload(null);
+              }
             }}
           >
             {products.map((item) => (
               <option key={item.id} value={item.id}>
-                {item.name} ({item.unit})
+                {item.name}
               </option>
             ))}
           </select>
@@ -168,165 +177,203 @@ export function RechnenPage() {
         </div>
       </div>
 
-      {chain && payload &&
-        leafStages.map((stage) => {
-          const replaced = payload.replaced_stages[String(stage.id)];
-          const isEnd = stage.outgoing_stage_id == null;
-          return (
-            <section key={stage.id} className="card space-y-3">
+      {graph && (
+        <div className="space-y-2">
+          <h2 className="font-semibold">Kette</h2>
+          <ChainGraph nodes={graph.nodes} edges={graph.edges} readOnly />
+        </div>
+      )}
+
+      {chain &&
+        payload &&
+        chain.nodes
+          .filter((node) => node.type === "product" && !node.is_functional && !skipped.has(node.id))
+          .map((node) => (
+            <section key={node.id} className="card space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <h2 className="font-semibold">{stage.name}</h2>
-                {!isEnd && (
-                  <select
-                    className="input max-w-md"
-                    value={replaced || ""}
-                    onChange={(e) => {
-                      const next = { ...payload.replaced_stages };
-                      if (e.target.value) next[String(stage.id)] = Number(e.target.value);
-                      else delete next[String(stage.id)];
-                      setPayload({ ...payload, replaced_stages: next });
-                    }}
-                  >
-                    <option value="">Zwischenprodukt fließt (kein Ersatz)</option>
-                    {own.map((item) => (
-                      <option key={item.id} value={item.id}>
-                        Stufe ersetzen: {item.name}
-                      </option>
-                    ))}
-                  </select>
-                )}
+                <h2 className="font-semibold">{node.name}</h2>
+                <select
+                  className="input max-w-md"
+                  value={payload.replaced_nodes[String(node.id)] || ""}
+                  onChange={(e) => {
+                    const next = { ...payload.replaced_nodes };
+                    if (e.target.value) next[String(node.id)] = Number(e.target.value);
+                    else delete next[String(node.id)];
+                    setPayload({ ...payload, replaced_nodes: next });
+                  }}
+                >
+                  <option value="">Produktfluss (kein Ersatz)</option>
+                  {own.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      Ersetzen: {item.name}
+                    </option>
+                  ))}
+                </select>
               </div>
-              {replaced ? (
-                <p className="text-sm text-slate-600">Vorstrecke entfällt. Es gilt der eigene Datensatz.</p>
-              ) : (
-                groupedSlots(stage.slots).map(([roleId, slots]) => {
-                  const extras = payload.extra_slots.filter((item) => item.stage_id === stage.id && item.role_id === roleId);
+              {payload.replaced_nodes[String(node.id)] && (
+                <p className="text-sm text-slate-600">Vorgänger, Abfall und Energie dieses Produkts entfallen.</p>
+              )}
+            </section>
+          ))}
+
+      {chain &&
+        payload &&
+        chain.nodes
+          .filter((node) => node.type === "process" && !skipped.has(node.id))
+          .map((process) => {
+            const productEdge = chain.edges.find(
+              (edge) => edge.kind === "material" && edge.source_id === process.id && chain.nodes.some((node) => node.id === edge.target_id && node.type === "product"),
+            );
+            const product = chain.nodes.find((node) => node.id === productEdge?.target_id);
+            if (product && (skipped.has(product.id) || payload.replaced_nodes[String(product.id)])) return null;
+            const categories = chain.edges
+              .filter((edge) => edge.target_id === process.id && edge.kind !== "waste")
+              .map((edge) => chain.nodes.find((node) => node.id === edge.source_id && node.type === "category"))
+              .filter((node): node is NonNullable<typeof node> => Boolean(node));
+            const combos = chain.combinations.filter((combo) => combo.process_node_id === process.id);
+            const named = (datasetId: number | null) => {
+              const dataset = [...catalog, ...own].find((item) => item.id === datasetId);
+              return dataset ? `${dataset.name}${dataset.location ? `, ${dataset.location}` : ""}` : "Datensatz";
+            };
+            return (
+              <section key={process.id} className="card space-y-4">
+                <h2 className="font-semibold">
+                  {process.name}
+                  {product ? ` → ${product.name}` : ""}
+                </h2>
+                {categories.map((category) => {
+                  const optional = category.optional && !category.datasets_differ;
+                  const on = !optional || payload.optional_on.includes(category.id);
+                  const datasetIds = category.datasets_differ
+                    ? [...new Set(combos.flatMap((combo) => combo.axes.filter((axis) => axis.category_node_id === category.id).map((axis) => axis.dataset_id)).filter((id): id is number => id != null))]
+                    : optionsFor(category.role_id).map((item) => item.id);
                   return (
-                    <div key={roleId} className="space-y-2 rounded-lg bg-slate-50 p-3">
+                    <div key={category.id} className="space-y-2">
                       <div className="flex items-center justify-between">
-                        <strong className="text-sm">{roleById[roleId]?.label || "Kategorie"}</strong>
-                        <button
-                          className="text-sm text-forest-700 underline"
-                          type="button"
-                          onClick={() =>
-                            setPayload({
-                              ...payload,
-                              extra_slots: [
-                                ...payload.extra_slots,
-                                {
-                                  key: `new-${Date.now()}`,
-                                  stage_id: stage.id,
-                                  role_id: roleId,
-                                  dataset_id: optionsFor(roleId)[0]?.id ?? null,
-                                  share: 0,
-                                },
-                              ],
-                            })
-                          }
-                        >
-                          Slot ergänzen
-                        </button>
-                      </div>
-                      {slots.map((slot) => {
-                        const optional = !slot.required || slot.optional_default_off;
-                        const on = !optional || payload.optional_on.includes(slot.id);
-                        return (
-                          <div key={slot.id} className="grid gap-2 md:grid-cols-[1fr_120px_auto] md:items-center">
-                            {optional && (
-                              <label className="text-sm">
-                                <input
-                                  type="checkbox"
-                                  className="mr-2"
-                                  checked={on}
-                                  onChange={(e) => {
-                                    const set = new Set(payload.optional_on);
-                                    if (e.target.checked) set.add(slot.id);
-                                    else set.delete(slot.id);
-                                    setPayload({ ...payload, optional_on: [...set] });
-                                  }}
-                                />
-                                optional
-                              </label>
-                            )}
-                            <select
-                              className="input md:col-span-1"
-                              disabled={optional && !on}
-                              value={payload.selections[String(slot.id)] || ""}
-                              onChange={(e) =>
-                                setPayload({
-                                  ...payload,
-                                  selections: { ...payload.selections, [String(slot.id)]: Number(e.target.value) },
-                                })
-                              }
-                            >
-                              <option value="">Bitte wählen</option>
-                              {optionsFor(roleId).map((item) => (
-                                <option key={item.id} value={item.id}>
-                                  {item.name}
-                                  {item.location ? `, ${item.location}` : ""} · {item.unit} · {sourceLabel(item.source_kind)}
-                                </option>
-                              ))}
-                            </select>
+                        <h3 className="text-sm font-medium">
+                          {roleById[category.role_id || 0]?.label || category.name}
+                          {category.datasets_differ ? "" : " · gleicher Einsatz"}
+                        </h3>
+                        {optional && (
+                          <label className="text-sm">
                             <input
-                              className="input"
-                              type="number"
-                              step="any"
-                              disabled={optional && !on}
-                              value={payload.shares[String(slot.id)] ?? slot.default_share}
-                              onChange={(e) =>
-                                setPayload({
-                                  ...payload,
-                                  shares: { ...payload.shares, [String(slot.id)]: Number(e.target.value) },
-                                })
-                              }
+                              type="checkbox"
+                              className="mr-2"
+                              checked={on}
+                              onChange={(e) => {
+                                const set = new Set(payload.optional_on);
+                                if (e.target.checked) set.add(category.id);
+                                else set.delete(category.id);
+                                setPayload({ ...payload, optional_on: [...set] });
+                              }}
                             />
-                            <span className="text-xs text-slate-500">Anteil (1 = 100 %)</span>
+                            einschalten
+                          </label>
+                        )}
+                      </div>
+                      {datasetIds.map((datasetId) => {
+                        const shareKey = `${category.id}:${datasetId}`;
+                        const fallback = chain.dataset_shares.find(
+                          (share) => share.category_node_id === category.id && share.dataset_id === datasetId,
+                        )?.default_share;
+                        return (
+                          <div key={shareKey} className="grid gap-2 md:grid-cols-[1fr_140px] md:items-center">
+                            <p className="text-sm">{named(datasetId)}</p>
+                            {datasetIds.length > 1 && (
+                              <input
+                                className="input"
+                                type="number"
+                                step="any"
+                                disabled={!on}
+                                value={payload.shares[shareKey] ?? fallback ?? 0}
+                                onChange={(e) =>
+                                  setPayload({
+                                    ...payload,
+                                    shares: { ...payload.shares, [shareKey]: Number(e.target.value) },
+                                  })
+                                }
+                              />
+                            )}
                           </div>
                         );
                       })}
-                      {extras.map((extra, index) => (
-                        <div key={extra.key} className="grid gap-2 md:grid-cols-[1fr_120px]">
-                          <select
-                            className="input"
-                            value={extra.dataset_id || ""}
-                            onChange={(e) => {
-                              const next = payload.extra_slots.map((item) =>
-                                item.key === extra.key ? { ...item, dataset_id: Number(e.target.value) } : item,
-                              );
-                              setPayload({ ...payload, extra_slots: next });
-                            }}
-                          >
-                            {optionsFor(roleId).map((item) => (
-                              <option key={item.id} value={item.id}>
-                                {item.name} · {sourceLabel(item.source_kind)}
-                              </option>
-                            ))}
-                          </select>
-                          <input
-                            className="input"
-                            type="number"
-                            step="any"
-                            value={extra.share}
-                            onChange={(e) => {
-                              const next = payload.extra_slots.map((item, i) =>
-                                i === index ? { ...item, share: Number(e.target.value) } : item,
-                              );
-                              setPayload({ ...payload, extra_slots: next });
-                            }}
-                          />
-                        </div>
-                      ))}
                     </div>
                   );
-                })
-              )}
+                })}
+                {combos.length > 0 && (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead>
+                        <tr className="text-slate-500">
+                          <th className="py-1 pr-3">Kombination</th>
+                          {categories.map((category) => (
+                            <th key={category.id} className="py-1 pr-3">
+                              {roleById[category.role_id || 0]?.label || category.name}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {combos.map((combo) => (
+                          <tr key={combo.id}>
+                            <td className="py-1 pr-3">
+                              {combo.axes.length
+                                ? combo.axes.map((axis) => named(axis.dataset_id)).join(" × ")
+                                : "eine Rezeptur"}
+                            </td>
+                            {categories.map((category) => {
+                              const amount = combo.amounts.find((item) => item.category_node_id === category.id);
+                              const value = amount?.input_amount ?? 0;
+                              const material = chain.edges.some(
+                                (edge) => edge.source_id === category.id && edge.target_id === process.id && edge.kind === "material",
+                              );
+                              const perUnit = product?.unit || chain.end_unit;
+                              return (
+                                <td key={category.id} className="py-1 pr-3">
+                                  {value} {category.unit} je 1 {perUnit}
+                                  {material && value > 0 ? ` · ${Math.round((1 / value) * 100)} %` : ""}
+                                  {material && value > 1
+                                    ? ` · Abfall ${Math.round((value - 1 + Number.EPSILON) * 1000) / 1000}`
+                                    : ""}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            );
+          })}
+
+      {chain &&
+        payload &&
+        chain.nodes
+          .filter((node) => node.type === "transport" && node.optional)
+          .map((node) => (
+            <section key={node.id} className="card">
+              <label className="text-sm">
+                <input
+                  type="checkbox"
+                  className="mr-2"
+                  checked={payload.optional_on.includes(node.id)}
+                  onChange={(e) => {
+                    const set = new Set(payload.optional_on);
+                    if (e.target.checked) set.add(node.id);
+                    else set.delete(node.id);
+                    setPayload({ ...payload, optional_on: [...set] });
+                  }}
+                />
+                {node.name} einschalten ({node.distance_km ?? 0} km)
+              </label>
             </section>
-          );
-        })}
+          ))}
 
       <div className="flex flex-wrap items-center gap-3">
         <button className="btn" type="button" onClick={() => void run()}>
-          Berechnen
+          Rechnen
         </button>
         <input className="input max-w-xs" value={saveName} onChange={(e) => setSaveName(e.target.value)} />
         <button className="btn-secondary" type="button" onClick={() => void save()}>
@@ -354,16 +401,6 @@ export function RechnenPage() {
       {result && !result.blockers.length && <ResultView result={result} indicators={indicators} />}
     </div>
   );
-}
-
-function groupedSlots(slots: Slot[]) {
-  const map = new Map<number, Slot[]>();
-  slots.forEach((slot) => {
-    const list = map.get(slot.role_id) || [];
-    list.push(slot);
-    map.set(slot.role_id, list);
-  });
-  return [...map.entries()];
 }
 
 function ResultView({ result, indicators }: { result: CalcResult; indicators: Indicator[] }) {
@@ -395,7 +432,7 @@ function ResultView({ result, indicators }: { result: CalcResult; indicators: In
         <table className="w-full text-left text-sm">
           <thead>
             <tr className="border-b text-slate-500">
-              <th className="py-2">Stufe</th>
+              <th className="py-2">Knoten</th>
               <th>Kategorie</th>
               <th>Datensatz</th>
               <th>Menge</th>
@@ -403,8 +440,8 @@ function ResultView({ result, indicators }: { result: CalcResult; indicators: In
           </thead>
           <tbody>
             {result.contributions.map((row) => (
-              <tr key={row.slot_key} className="border-b last:border-0">
-                <td className="py-2">{row.stage_name}</td>
+              <tr key={row.use_key} className="border-b last:border-0">
+                <td className="py-2">{row.node_name}</td>
                 <td>{row.role_label}</td>
                 <td>{row.dataset_name}</td>
                 <td>
@@ -444,7 +481,7 @@ function ResultView({ result, indicators }: { result: CalcResult; indicators: In
       <table className="w-full text-left text-sm">
         <thead>
           <tr className="border-b text-slate-500">
-            <th className="py-2">Stufe</th>
+            <th className="py-2">Knoten</th>
             <th>Kategorie</th>
             <th>Datensatz</th>
             <th>Indikator</th>
@@ -455,8 +492,8 @@ function ResultView({ result, indicators }: { result: CalcResult; indicators: In
           {result.contributions
             .filter((row) => row.indicator_id === "climate_change")
             .map((row) => (
-              <tr key={`${row.slot_key}-${row.indicator_id}`} className="border-b last:border-0">
-                <td className="py-2">{row.stage_name}</td>
+              <tr key={`${row.use_key}-${row.indicator_id}`} className="border-b last:border-0">
+                <td className="py-2">{row.node_name}</td>
                 <td>{row.role_label}</td>
                 <td>{row.dataset_name}</td>
                 <td>Klimawandel</td>

@@ -56,6 +56,9 @@ export function AdminLayout() {
         <NavLink to="/admin/archiv" className={adminLink}>
           Archiv und Import
         </NavLink>
+        <NavLink to="/admin/katalog" className={adminLink}>
+          Katalog
+        </NavLink>
         <NavLink to="/admin/kategorien" className={adminLink}>
           Kategorien
         </NavLink>

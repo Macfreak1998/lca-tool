@@ -6,10 +6,10 @@ from sqlalchemy.orm import selectinload
 from app.deps import CurrentUser, DbDep
 from app.models import (
     Chain,
+    ChainCombination,
     Configuration,
-    ConfigurationExtraSlot,
     ConfigurationOptional,
-    ConfigurationReplacedStage,
+    ConfigurationReplacedNode,
     ConfigurationSelection,
     ConfigurationShare,
 )
@@ -25,11 +25,15 @@ def _load(db, user_id: int, config_id: int) -> Configuration:
         db.query(Configuration)
         .options(
             selectinload(Configuration.chain).selectinload(Chain.end_product),
+            selectinload(Configuration.chain).selectinload(Chain.nodes),
+            selectinload(Configuration.chain).selectinload(Chain.edges),
+            selectinload(Configuration.chain).selectinload(Chain.combinations).selectinload(ChainCombination.axes),
+            selectinload(Configuration.chain).selectinload(Chain.combinations).selectinload(ChainCombination.amounts),
+            selectinload(Configuration.chain).selectinload(Chain.dataset_shares),
             selectinload(Configuration.selections),
             selectinload(Configuration.shares),
             selectinload(Configuration.optional_on),
-            selectinload(Configuration.extra_slots),
-            selectinload(Configuration.replaced_stages),
+            selectinload(Configuration.replaced_nodes),
         )
         .filter(Configuration.id == config_id, Configuration.user_id == user_id)
         .first()
@@ -48,31 +52,26 @@ def _apply(db, row: Configuration, payload: ConfigurationIn) -> None:
     row.selections.clear()
     row.shares.clear()
     row.optional_on.clear()
-    row.extra_slots.clear()
-    row.replaced_stages.clear()
+    row.replaced_nodes.clear()
     db.flush()
-    for slot_id, dataset_id in payload.selections.items():
+    for node_id, dataset_id in payload.selections.items():
         row.selections.append(
-            ConfigurationSelection(slot_id=int(slot_id), dataset_id=dataset_id)
+            ConfigurationSelection(node_id=int(node_id), dataset_id=dataset_id)
         )
     for key, percent in payload.shares.items():
-        row.shares.append(ConfigurationShare(slot_key=str(key), percent=percent))
-    for slot_id in payload.optional_on:
-        row.optional_on.append(ConfigurationOptional(slot_id=slot_id))
-    for extra in payload.extra_slots:
-        if extra.dataset_id is None:
-            continue
-        row.extra_slots.append(
-            ConfigurationExtraSlot(
-                stage_id=extra.stage_id,
-                role_id=extra.role_id,
-                dataset_id=extra.dataset_id,
-                share=extra.share,
+        category_id, dataset_id = key.split(":", 1)
+        row.shares.append(
+            ConfigurationShare(
+                category_node_id=int(category_id),
+                dataset_id=int(dataset_id),
+                percent=percent,
             )
         )
-    for stage_id, dataset_id in payload.replaced_stages.items():
-        row.replaced_stages.append(
-            ConfigurationReplacedStage(stage_id=int(stage_id), dataset_id=dataset_id)
+    for node_id in payload.optional_on:
+        row.optional_on.append(ConfigurationOptional(node_id=node_id))
+    for node_id, dataset_id in payload.replaced_nodes.items():
+        row.replaced_nodes.append(
+            ConfigurationReplacedNode(node_id=int(node_id), dataset_id=dataset_id)
         )
 
 
@@ -82,11 +81,15 @@ def list_configurations(user: CurrentUser, db: DbDep) -> list[ConfigurationOut]:
         db.query(Configuration)
         .options(
             selectinload(Configuration.chain).selectinload(Chain.end_product),
+            selectinload(Configuration.chain).selectinload(Chain.nodes),
+            selectinload(Configuration.chain).selectinload(Chain.edges),
+            selectinload(Configuration.chain).selectinload(Chain.combinations).selectinload(ChainCombination.axes),
+            selectinload(Configuration.chain).selectinload(Chain.combinations).selectinload(ChainCombination.amounts),
+            selectinload(Configuration.chain).selectinload(Chain.dataset_shares),
             selectinload(Configuration.selections),
             selectinload(Configuration.shares),
             selectinload(Configuration.optional_on),
-            selectinload(Configuration.extra_slots),
-            selectinload(Configuration.replaced_stages),
+            selectinload(Configuration.replaced_nodes),
         )
         .filter(Configuration.user_id == user.id)
         .order_by(Configuration.updated_at.desc())

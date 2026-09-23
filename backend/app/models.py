@@ -151,49 +151,124 @@ class Chain(Base):
     end_unit: Mapped[str] = mapped_column(String(32))
 
     end_product: Mapped[EndProduct] = relationship(back_populates="chains")
-    stages: Mapped[list["Stage"]] = relationship(
-        back_populates="chain", cascade="all, delete-orphan", order_by="Stage.sort_order"
+    nodes: Mapped[list["ChainNode"]] = relationship(
+        back_populates="chain", cascade="all, delete-orphan", passive_deletes=True
+    )
+    edges: Mapped[list["ChainEdge"]] = relationship(
+        back_populates="chain", cascade="all, delete-orphan", passive_deletes=True
+    )
+    combinations: Mapped[list["ChainCombination"]] = relationship(
+        back_populates="chain", cascade="all, delete-orphan", passive_deletes=True
+    )
+    dataset_shares: Mapped[list["ChainDatasetShare"]] = relationship(
+        back_populates="chain", cascade="all, delete-orphan", passive_deletes=True
     )
     configurations: Mapped[list["Configuration"]] = relationship(back_populates="chain")
 
 
-class Stage(Base):
-    __tablename__ = "stages"
+class ChainNode(Base):
+    __tablename__ = "chain_nodes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     chain_id: Mapped[int] = mapped_column(ForeignKey("chains.id", ondelete="CASCADE"))
+    type: Mapped[str] = mapped_column(String(32))
     name: Mapped[str] = mapped_column(String(200))
-    sort_order: Mapped[int] = mapped_column(Integer, default=0)
-    outgoing_stage_id: Mapped[int | None] = mapped_column(
-        ForeignKey("stages.id"), nullable=True
-    )
-    upstream_amount: Mapped[float] = mapped_column(Float, default=1.0)
+    position_x: Mapped[float] = mapped_column(Float, default=0.0)
+    position_y: Mapped[float] = mapped_column(Float, default=0.0)
+    role_id: Mapped[int | None] = mapped_column(ForeignKey("roles.id"), nullable=True)
+    dataset_id: Mapped[int | None] = mapped_column(ForeignKey("datasets.id"), nullable=True)
+    unit: Mapped[str] = mapped_column(String(32), default="")
+    distance_km: Mapped[float | None] = mapped_column(Float, nullable=True)
+    optional: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_functional: Mapped[bool] = mapped_column(Boolean, default=False)
+    datasets_differ: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    chain: Mapped[Chain] = relationship(back_populates="stages")
-    slots: Mapped[list["Slot"]] = relationship(
-        back_populates="stage", cascade="all, delete-orphan"
-    )
+    chain: Mapped[Chain] = relationship(back_populates="nodes")
+    role: Mapped[Role | None] = relationship()
+    dataset: Mapped[Dataset | None] = relationship()
 
 
-class Slot(Base):
-    __tablename__ = "slots"
+class ChainEdge(Base):
+    __tablename__ = "chain_edges"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    stage_id: Mapped[int] = mapped_column(ForeignKey("stages.id", ondelete="CASCADE"))
-    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"))
-    required: Mapped[bool] = mapped_column(Boolean, default=True)
-    optional_default_off: Mapped[bool] = mapped_column(Boolean, default=False)
-    min_count: Mapped[int] = mapped_column(Integer, default=1)
-    specific_amount: Mapped[float] = mapped_column(Float)
-    unit: Mapped[str] = mapped_column(String(32))
-    default_dataset_id: Mapped[int | None] = mapped_column(
-        ForeignKey("datasets.id"), nullable=True
+    chain_id: Mapped[int] = mapped_column(ForeignKey("chains.id", ondelete="CASCADE"))
+    source_id: Mapped[int] = mapped_column(ForeignKey("chain_nodes.id", ondelete="CASCADE"))
+    target_id: Mapped[int] = mapped_column(ForeignKey("chain_nodes.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(32), default="material")
+    input_amount: Mapped[float] = mapped_column(Float, default=1.0)
+    efficiency: Mapped[float] = mapped_column(Float, default=1.0)
+
+    chain: Mapped[Chain] = relationship(back_populates="edges")
+    source: Mapped[ChainNode] = relationship(foreign_keys=[source_id])
+    target: Mapped[ChainNode] = relationship(foreign_keys=[target_id])
+
+
+class ChainCombination(Base):
+    __tablename__ = "chain_combinations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(ForeignKey("chains.id", ondelete="CASCADE"))
+    process_node_id: Mapped[int] = mapped_column(ForeignKey("chain_nodes.id", ondelete="CASCADE"))
+
+    chain: Mapped[Chain] = relationship(back_populates="combinations")
+    process_node: Mapped[ChainNode] = relationship(foreign_keys=[process_node_id])
+    axes: Mapped[list["ChainCombinationAxis"]] = relationship(
+        back_populates="combination", cascade="all, delete-orphan", passive_deletes=True
     )
+    amounts: Mapped[list["ChainCombinationAmount"]] = relationship(
+        back_populates="combination", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class ChainCombinationAxis(Base):
+    __tablename__ = "chain_combination_axes"
+    __table_args__ = (UniqueConstraint("combination_id", "category_node_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    combination_id: Mapped[int] = mapped_column(
+        ForeignKey("chain_combinations.id", ondelete="CASCADE")
+    )
+    category_node_id: Mapped[int] = mapped_column(ForeignKey("chain_nodes.id", ondelete="CASCADE"))
+    dataset_id: Mapped[int | None] = mapped_column(ForeignKey("datasets.id"), nullable=True)
+
+    combination: Mapped[ChainCombination] = relationship(back_populates="axes")
+    category_node: Mapped[ChainNode] = relationship()
+    dataset: Mapped[Dataset | None] = relationship()
+
+
+class ChainCombinationAmount(Base):
+    __tablename__ = "chain_combination_amounts"
+    __table_args__ = (UniqueConstraint("combination_id", "category_node_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    combination_id: Mapped[int] = mapped_column(
+        ForeignKey("chain_combinations.id", ondelete="CASCADE")
+    )
+    category_node_id: Mapped[int] = mapped_column(ForeignKey("chain_nodes.id", ondelete="CASCADE"))
+    input_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    recovery_node_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chain_nodes.id", ondelete="SET NULL"), nullable=True
+    )
+
+    combination: Mapped[ChainCombination] = relationship(back_populates="amounts")
+    category_node: Mapped[ChainNode] = relationship(foreign_keys=[category_node_id])
+    recovery_node: Mapped[ChainNode | None] = relationship(foreign_keys=[recovery_node_id])
+
+
+class ChainDatasetShare(Base):
+    __tablename__ = "chain_dataset_shares"
+    __table_args__ = (UniqueConstraint("category_node_id", "dataset_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(ForeignKey("chains.id", ondelete="CASCADE"))
+    category_node_id: Mapped[int] = mapped_column(ForeignKey("chain_nodes.id", ondelete="CASCADE"))
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"))
     default_share: Mapped[float] = mapped_column(Float, default=1.0)
 
-    stage: Mapped[Stage] = relationship(back_populates="slots")
-    role: Mapped[Role] = relationship()
-    default_dataset: Mapped[Dataset | None] = relationship()
+    chain: Mapped[Chain] = relationship(back_populates="dataset_shares")
+    category_node: Mapped[ChainNode] = relationship()
+    dataset: Mapped[Dataset] = relationship()
 
 
 class Configuration(Base):
@@ -222,10 +297,7 @@ class Configuration(Base):
     optional_on: Mapped[list["ConfigurationOptional"]] = relationship(
         back_populates="configuration", cascade="all, delete-orphan"
     )
-    extra_slots: Mapped[list["ConfigurationExtraSlot"]] = relationship(
-        back_populates="configuration", cascade="all, delete-orphan"
-    )
-    replaced_stages: Mapped[list["ConfigurationReplacedStage"]] = relationship(
+    replaced_nodes: Mapped[list["ConfigurationReplacedNode"]] = relationship(
         back_populates="configuration", cascade="all, delete-orphan"
     )
 
@@ -237,7 +309,7 @@ class ConfigurationSelection(Base):
     configuration_id: Mapped[int] = mapped_column(
         ForeignKey("configurations.id", ondelete="CASCADE")
     )
-    slot_id: Mapped[int] = mapped_column(Integer)
+    node_id: Mapped[int] = mapped_column(Integer)
     dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id"))
 
     configuration: Mapped[Configuration] = relationship(back_populates="selections")
@@ -251,7 +323,8 @@ class ConfigurationShare(Base):
     configuration_id: Mapped[int] = mapped_column(
         ForeignKey("configurations.id", ondelete="CASCADE")
     )
-    slot_key: Mapped[str] = mapped_column(String(64))
+    category_node_id: Mapped[int] = mapped_column(Integer)
+    dataset_id: Mapped[int] = mapped_column(Integer)
     percent: Mapped[float] = mapped_column(Float)
 
     configuration: Mapped[Configuration] = relationship(back_populates="shares")
@@ -264,38 +337,22 @@ class ConfigurationOptional(Base):
     configuration_id: Mapped[int] = mapped_column(
         ForeignKey("configurations.id", ondelete="CASCADE")
     )
-    slot_id: Mapped[int] = mapped_column(Integer)
+    node_id: Mapped[int] = mapped_column(Integer)
 
     configuration: Mapped[Configuration] = relationship(back_populates="optional_on")
 
 
-class ConfigurationExtraSlot(Base):
-    __tablename__ = "configuration_extra_slots"
+class ConfigurationReplacedNode(Base):
+    __tablename__ = "configuration_replaced_nodes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     configuration_id: Mapped[int] = mapped_column(
         ForeignKey("configurations.id", ondelete="CASCADE")
     )
-    stage_id: Mapped[int] = mapped_column(Integer)
-    role_id: Mapped[int] = mapped_column(Integer)
-    dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id"))
-    share: Mapped[float] = mapped_column(Float, default=0.0)
-
-    configuration: Mapped[Configuration] = relationship(back_populates="extra_slots")
-    dataset: Mapped[Dataset] = relationship()
-
-
-class ConfigurationReplacedStage(Base):
-    __tablename__ = "configuration_replaced_stages"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    configuration_id: Mapped[int] = mapped_column(
-        ForeignKey("configurations.id", ondelete="CASCADE")
-    )
-    stage_id: Mapped[int] = mapped_column(Integer)
+    node_id: Mapped[int] = mapped_column(Integer)
     dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id"))
 
-    configuration: Mapped[Configuration] = relationship(back_populates="replaced_stages")
+    configuration: Mapped[Configuration] = relationship(back_populates="replaced_nodes")
     dataset: Mapped[Dataset] = relationship()
 
 

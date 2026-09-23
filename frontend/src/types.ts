@@ -5,7 +5,7 @@ export type User = {
   email_verified: boolean;
 };
 
-export type Role = { id: number; slug: string; label: string };
+export type Role = { id: number; slug: string; label: string; dataset_count?: number };
 export type EndProduct = { id: number; name: string; unit: string };
 export type Indicator = { id: string; label: string; unit: string };
 
@@ -36,26 +36,46 @@ export type ArchiveHit = {
   likely_market: boolean;
 };
 
-export type Slot = {
+export type NodeType = "category" | "product" | "process" | "transport" | "recovery";
+export type EdgeKind = "material" | "energy" | "waste";
+
+export type ChainNode = {
   id: number;
-  role_id: number;
-  required: boolean;
-  optional_default_off: boolean;
-  min_count: number;
-  specific_amount: number;
+  type: NodeType;
+  name: string;
+  position_x: number;
+  position_y: number;
+  role_id: number | null;
+  dataset_id: number | null;
   unit: string;
-  default_dataset_id: number | null;
-  default_share: number;
+  distance_km: number | null;
+  optional: boolean;
+  is_functional: boolean;
+  datasets_differ: boolean;
 };
 
-export type Stage = {
+export type ChainEdge = {
   id: number;
-  name: string;
-  sort_order: number;
-  outgoing_stage_id: number | null;
-  upstream_amount: number;
-  slots: Slot[];
+  source_id: number;
+  target_id: number;
+  kind: EdgeKind;
+  input_amount: number;
+  efficiency: number;
 };
+
+export type CombinationAxis = { category_node_id: number; dataset_id: number | null };
+export type CombinationAmount = {
+  category_node_id: number;
+  input_amount: number;
+  recovery_node_id: number | null;
+};
+export type ChainCombination = {
+  id: number;
+  process_node_id: number;
+  axes: CombinationAxis[];
+  amounts: CombinationAmount[];
+};
+export type DatasetShare = { category_node_id: number; dataset_id: number; default_share: number };
 
 export type Chain = {
   id: number;
@@ -64,15 +84,10 @@ export type Chain = {
   end_product_id: number;
   end_unit: string;
   end_product_name: string;
-  stages: Stage[];
-};
-
-export type ExtraSlot = {
-  key: string;
-  stage_id: number;
-  role_id: number;
-  dataset_id: number | null;
-  share: number;
+  nodes: ChainNode[];
+  edges: ChainEdge[];
+  combinations: ChainCombination[];
+  dataset_shares: DatasetShare[];
 };
 
 export type CalculatePayload = {
@@ -81,16 +96,15 @@ export type CalculatePayload = {
   selections: Record<string, number>;
   shares: Record<string, number>;
   optional_on: number[];
-  extra_slots: ExtraSlot[];
-  replaced_stages: Record<string, number>;
+  replaced_nodes: Record<string, number>;
 };
 
 export type Contribution = {
-  stage_id: number;
-  stage_name: string;
+  node_id: number;
+  node_name: string;
   role_id: number;
   role_label: string;
-  slot_key: string;
+  use_key: string;
   dataset_id: number;
   dataset_name: string;
   amount: number;
@@ -124,8 +138,7 @@ export type Configuration = {
   selections: Record<string, number>;
   shares: Record<string, number>;
   optional_on: number[];
-  extra_slots: ExtraSlot[];
-  replaced_stages: Record<string, number>;
+  replaced_nodes: Record<string, number>;
   chain_name: string;
   end_product_id: number;
   end_product_name: string;

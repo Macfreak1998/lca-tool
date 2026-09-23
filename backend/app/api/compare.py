@@ -5,7 +5,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import selectinload
 
 from app.deps import CurrentUser, DbDep
-from app.models import Chain, Configuration, Dataset, Role, Stage
+from app.models import Chain, ChainCombination, Configuration, Dataset, Role
 from app.schemas import CompareIn, CompareItemOut, CompareOut, ConfigurationOut
 from app.serialize import calc_input_from_config, calc_out, configuration_out
 from app.services.calculate import calculate
@@ -19,12 +19,15 @@ def _load_configs(db, user_id: int, ids: list[int]) -> list[Configuration]:
         db.query(Configuration)
         .options(
             selectinload(Configuration.chain).selectinload(Chain.end_product),
-            selectinload(Configuration.chain).selectinload(Chain.stages).selectinload(Stage.slots),
+            selectinload(Configuration.chain).selectinload(Chain.nodes),
+            selectinload(Configuration.chain).selectinload(Chain.edges),
+            selectinload(Configuration.chain).selectinload(Chain.combinations).selectinload(ChainCombination.axes),
+            selectinload(Configuration.chain).selectinload(Chain.combinations).selectinload(ChainCombination.amounts),
+            selectinload(Configuration.chain).selectinload(Chain.dataset_shares),
             selectinload(Configuration.selections),
             selectinload(Configuration.shares),
             selectinload(Configuration.optional_on),
-            selectinload(Configuration.extra_slots),
-            selectinload(Configuration.replaced_stages),
+            selectinload(Configuration.replaced_nodes),
         )
         .filter(Configuration.user_id == user_id, Configuration.id.in_(ids))
         .all()

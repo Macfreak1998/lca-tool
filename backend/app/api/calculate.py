@@ -5,10 +5,10 @@ from fastapi.responses import Response
 from sqlalchemy.orm import selectinload
 
 from app.deps import CurrentUser, DbDep
-from app.models import Chain, Dataset, Role, Stage
+from app.models import Chain, ChainCombination, Dataset, Role
 from app.schemas import CalculateIn, CalculateOut
 from app.serialize import calc_out
-from app.services.calculate import CalcInput, ExtraSlot, calculate
+from app.services.calculate import CalcInput, calculate
 from app.services.export import to_csv, to_xlsx
 
 router = APIRouter()
@@ -33,17 +33,7 @@ def _to_input(payload: CalculateIn) -> CalcInput:
         selections={str(key): value for key, value in payload.selections.items()},
         shares=payload.shares,
         optional_on=payload.optional_on,
-        extra_slots=[
-            ExtraSlot(
-                key=item.key,
-                stage_id=item.stage_id,
-                role_id=item.role_id,
-                dataset_id=item.dataset_id,
-                share=item.share,
-            )
-            for item in payload.extra_slots
-        ],
-        replaced_stages={int(key): value for key, value in payload.replaced_stages.items()},
+        replaced_nodes={int(key): value for key, value in payload.replaced_nodes.items()},
     )
 
 
@@ -51,7 +41,14 @@ def _to_input(payload: CalculateIn) -> CalcInput:
 def run_calculate(payload: CalculateIn, _user: CurrentUser, db: DbDep) -> CalculateOut:
     chain = (
         db.query(Chain)
-        .options(selectinload(Chain.stages).selectinload(Stage.slots), selectinload(Chain.end_product))
+        .options(
+            selectinload(Chain.nodes),
+            selectinload(Chain.edges),
+            selectinload(Chain.combinations).selectinload(ChainCombination.axes),
+            selectinload(Chain.combinations).selectinload(ChainCombination.amounts),
+            selectinload(Chain.dataset_shares),
+            selectinload(Chain.end_product),
+        )
         .filter(Chain.id == payload.chain_id)
         .first()
     )
@@ -65,7 +62,14 @@ def run_calculate(payload: CalculateIn, _user: CurrentUser, db: DbDep) -> Calcul
 def export_calculate(payload: CalculateIn, _user: CurrentUser, db: DbDep, format: str = "csv") -> Response:
     chain = (
         db.query(Chain)
-        .options(selectinload(Chain.stages).selectinload(Stage.slots), selectinload(Chain.end_product))
+        .options(
+            selectinload(Chain.nodes),
+            selectinload(Chain.edges),
+            selectinload(Chain.combinations).selectinload(ChainCombination.axes),
+            selectinload(Chain.combinations).selectinload(ChainCombination.amounts),
+            selectinload(Chain.dataset_shares),
+            selectinload(Chain.end_product),
+        )
         .filter(Chain.id == payload.chain_id)
         .first()
     )
