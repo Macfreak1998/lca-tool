@@ -69,4 +69,4 @@ Die Tests nutzen kleine Fixtures, nicht das 29-GB-Archiv.
 5. Kette als Entwurf modellieren, Proberechnung, veröffentlichen
 6. Unter **Rechnen** durchrechnen
 
-Es gibt kein fest verdrahtetes HOF-Rezept. `DEMO_SEED=true` legt nur die kleine Docker-Demo an.
+Es gibt kein fest verdrahtetes HOF-Rezept. `DEMO_SEED=true` legt die kleine Docker-Demo an und veröffentlicht zusätzlich die Beispielkette „Stärkecompound → Spritzgussteil“ mit Prüfwerten für alle 16 PEF-Kategorien. Die Kette wird nur ergänzt, wenn sie noch fehlt.
