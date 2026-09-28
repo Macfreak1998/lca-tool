@@ -155,6 +155,134 @@ def test_publish_blocks_on_bad_shares(db):
     assert any("100" in msg for msg in errors)
 
 
+def test_publish_blocks_transport_on_energy(db):
+    chain, role, _folie, process = _base(db)
+    transport = ChainNode(chain=chain, type="transport", name="Stromweg", optional=True, unit="kg·km")
+    energy = ChainNode(chain=chain, type="category", name="Energie", role_id=role.id, unit="kWh")
+    db.add_all([transport, energy])
+    db.flush()
+    db.add_all(
+        [
+            ChainEdge(chain=chain, source_id=energy.id, target_id=transport.id, kind="energy"),
+            ChainEdge(chain=chain, source_id=transport.id, target_id=process.id, kind="energy"),
+        ]
+    )
+    db.flush()
+    errors = validate_structure(chain)
+    assert any("Transport" in msg for msg in errors)
+
+
+def test_publish_accepts_transport_between_product_and_process(db):
+    chain, role, folie, process = _base(db)
+    ds = Dataset(name="Strom", location="DE", unit="kWh", source_kind=SOURCE_ECOINVENT)
+    ds.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=CLIMATE_CHANGE, value=0.4))
+    db.add(ds)
+    db.flush()
+    _energy(db, chain, role, process, ds)
+    granulat = ChainNode(chain=chain, type="product", name="Granulat", unit="kg")
+    transport = ChainNode(
+        chain=chain, type="transport", name="Lkw", dataset_id=ds.id, unit="kg·km", distance_km=10
+    )
+    db.add_all([granulat, transport])
+    db.flush()
+    db.add_all(
+        [
+            ChainEdge(chain=chain, source_id=granulat.id, target_id=transport.id, kind="material"),
+            ChainEdge(chain=chain, source_id=transport.id, target_id=process.id, kind="material"),
+        ]
+    )
+    db.flush()
+    errors = validate_structure(chain)
+    assert not any("Transport" in msg for msg in errors)
+    assert folie.id
+
+
+def test_publish_blocks_recovery_without_inventory(db):
+    chain, _role, _folie, process = _base(db)
+    starch = Role(slug="staerke", label="Stärke")
+    db.add(starch)
+    db.flush()
+    starch_ds = Dataset(name="Stärke", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    starch_ds.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=CLIMATE_CHANGE, value=1.0))
+    empty = Dataset(name="Leer", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    db.add_all([starch_ds, empty])
+    db.flush()
+    category = ChainNode(chain=chain, type="category", name="Stärke", role_id=starch.id, unit="kg")
+    recovery = ChainNode(chain=chain, type="recovery", name="Verwertung", dataset_id=empty.id, unit="kg")
+    db.add_all([category, recovery])
+    db.flush()
+    db.add(ChainEdge(chain=chain, source_id=category.id, target_id=process.id, kind="material"))
+    combo = ChainCombination(chain=chain, process_node_id=process.id)
+    db.add(combo)
+    db.flush()
+    db.add(
+        ChainCombinationAmount(
+            combination=combo,
+            category_node_id=category.id,
+            input_amount=1.0,
+            efficiency=0.8,
+            recovery_node_id=recovery.id,
+        )
+    )
+    db.add(
+        ChainDatasetShare(
+            chain=chain, category_node_id=category.id, dataset_id=starch_ds.id, default_share=1.0
+        )
+    )
+    db.flush()
+    errors = validate_structure(chain)
+    assert any("kein Inventar" in msg for msg in errors)
+
+
+def test_publish_blocks_two_recoveries(db):
+    chain, _role, _folie, process = _base(db)
+    starch = Role(slug="staerke-zwei", label="Stärke")
+    db.add(starch)
+    db.flush()
+    starch_ds = Dataset(name="Stärke", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    starch_ds.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=CLIMATE_CHANGE, value=1.0))
+    first_ds = Dataset(name="Verbrennung A", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    second_ds = Dataset(name="Verbrennung B", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    first_ds.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=CLIMATE_CHANGE, value=1.0))
+    second_ds.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=CLIMATE_CHANGE, value=1.0))
+    db.add_all([starch_ds, first_ds, second_ds])
+    db.flush()
+    category = ChainNode(chain=chain, type="category", name="Stärke", role_id=starch.id, unit="kg")
+    other = ChainNode(chain=chain, type="category", name="Additiv", role_id=starch.id, unit="kg")
+    first = ChainNode(chain=chain, type="recovery", name="Verwertung A", dataset_id=first_ds.id, unit="kg")
+    second = ChainNode(chain=chain, type="recovery", name="Verwertung B", dataset_id=second_ds.id, unit="kg")
+    db.add_all([category, other, first, second])
+    db.flush()
+    db.add_all(
+        [
+            ChainEdge(chain=chain, source_id=category.id, target_id=process.id, kind="material"),
+            ChainEdge(chain=chain, source_id=other.id, target_id=process.id, kind="material"),
+        ]
+    )
+    combo = ChainCombination(chain=chain, process_node_id=process.id)
+    db.add(combo)
+    db.flush()
+    db.add_all(
+        [
+            ChainCombinationAmount(
+                combination=combo, category_node_id=category.id, input_amount=0.6, efficiency=0.9, recovery_node_id=first.id
+            ),
+            ChainCombinationAmount(
+                combination=combo, category_node_id=other.id, input_amount=0.4, efficiency=0.8, recovery_node_id=second.id
+            ),
+        ]
+    )
+    db.add_all(
+        [
+            ChainDatasetShare(chain=chain, category_node_id=category.id, dataset_id=starch_ds.id, default_share=1.0),
+            ChainDatasetShare(chain=chain, category_node_id=other.id, dataset_id=starch_ds.id, default_share=1.0),
+        ]
+    )
+    db.flush()
+    errors = validate_structure(chain)
+    assert any("nur eine Verwertung" in message for message in errors)
+
+
 def test_publish_without_lcia_uses_inventory(db, monkeypatch):
     monkeypatch.setattr("app.services.calculate.try_load_method", lambda: None)
     chain, role, _folie, process = _base(db)

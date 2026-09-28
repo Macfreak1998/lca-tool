@@ -84,6 +84,8 @@ class _ProductLink:
     upstream_id: int
     downstream_id: int
     input_amount: float
+    soll: float = 1.0
+    efficiency: float = 1.0
 
 
 def _role_label(role: Role | None, role_id: int, fallback: str = "") -> str:
@@ -135,12 +137,93 @@ def _flow_source(
         return node
     for hop in incoming.get(node_id, []):
         upstream = nodes.get(hop.source_id)
-        if upstream and upstream.type in {"product", "process"}:
+        if upstream and upstream.type in {"product", "process", "category"}:
             return upstream
     return None
 
 
-def product_links(nodes: dict[int, ChainNode], edges: list[ChainEdge]) -> list[_ProductLink]:
+def deployment(soll: float, efficiency: float) -> float:
+    if efficiency <= 1e-12:
+        return 0.0
+    return soll / efficiency
+
+
+def material_waste(soll: float, efficiency: float) -> float:
+    """Abfall einer Materialkante. Energie erzeugt keinen Abfall."""
+    if efficiency <= 1e-12 or soll <= 0:
+        return 0.0
+    return max(0.0, soll * (1.0 / efficiency - 1.0))
+
+
+def reaches(edges: list[ChainEdge], start_id: int, goal_id: int) -> bool:
+    if start_id == goal_id:
+        return True
+    outgoing: dict[int, list[int]] = defaultdict(list)
+    for edge in edges:
+        if edge.kind == "waste":
+            continue
+        outgoing[edge.source_id].append(edge.target_id)
+    seen: set[int] = set()
+    stack = [start_id]
+    while stack:
+        node_id = stack.pop()
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        if node_id == goal_id:
+            return True
+        stack.extend(outgoing.get(node_id, []))
+    return False
+
+
+def allocation_factor(
+    process_id: int,
+    nodes: dict[int, ChainNode],
+    edges: list[ChainEdge],
+    functional_id: int,
+) -> tuple[float, str | None]:
+    """Anteil des fortgeführten Produkts. Nebenprodukte bleiben am Rand."""
+    outs = []
+    for edge in edges:
+        if edge.source_id != process_id or edge.kind != "material":
+            continue
+        target = nodes.get(edge.target_id)
+        if target is not None and target.type == "product":
+            outs.append(edge)
+    if not outs:
+        return 1.0, None
+    continued = [edge for edge in outs if reaches(edges, edge.target_id, functional_id)]
+    byproducts = [edge for edge in outs if edge not in continued]
+    process = nodes[process_id]
+    if len(continued) != 1:
+        return 1.0, f"Prozess „{process.name}“ braucht genau ein Produkt auf dem Weg zum Endprodukt."
+    for edge in byproducts:
+        target = nodes[edge.target_id]
+        if any(item.source_id == target.id and item.kind != "waste" for item in edges):
+            return 1.0, f"Nebenprodukt „{target.name}“ darf die Kette nicht fortsetzen."
+    if not byproducts:
+        return 1.0, None
+    continued_unit = nodes[continued[0].target_id].unit
+    if all(same_unit(nodes[edge.target_id].unit, continued_unit) for edge in byproducts):
+        total = 1.0 + sum(max(0.0, edge.input_amount) for edge in byproducts)
+        if total <= 1e-12:
+            return 1.0, None
+        return 1.0 / total, None
+    shares: list[float] = []
+    for edge in outs:
+        if edge.allocation_share is None:
+            return 1.0, f"Anteile fehlen für die Produkte von „{process.name}“."
+        shares.append(edge.allocation_share)
+    total = sum(shares)
+    if abs(total - 1.0) > 1e-6 and abs(total - 100.0) > 1e-6:
+        return 1.0, f"Anteile der Produkte von „{process.name}“ müssen 100 % ergeben."
+    factor = 100.0 if total > 2 else 1.0
+    return (continued[0].allocation_share or 0.0) / factor, None
+
+
+def product_links(
+    nodes: dict[int, ChainNode], edges: list[ChainEdge], functional_id: int
+) -> list[_ProductLink]:
     incoming: dict[int, list[ChainEdge]] = defaultdict(list)
     for edge in edges:
         if edge.kind == "material":
@@ -156,14 +239,16 @@ def product_links(nodes: dict[int, ChainNode], edges: list[ChainEdge]) -> list[_
         if source is None or source.type not in {"product", "process"}:
             continue
         if source.type == "process" and target.type == "product":
-            amount = 1.0
-        elif source.type == "product" and target.type == "process":
-            amount = edge.input_amount or 0.0
-        elif source.type == "product" and target.type == "product":
-            amount = edge.input_amount or 0.0
-        else:
+            if not reaches(edges, target.id, functional_id):
+                continue
+            links.append(_ProductLink(source.id, target.id, 1.0, 1.0, 1.0))
             continue
-        links.append(_ProductLink(source.id, target.id, amount))
+        if source.type == "product" and target.type in {"process", "product"}:
+            soll = edge.input_amount or 0.0
+            efficiency = edge.efficiency if edge.efficiency and edge.efficiency > 0 else 1.0
+            links.append(
+                _ProductLink(source.id, target.id, deployment(soll, efficiency), soll, efficiency)
+            )
     return links
 
 
@@ -182,16 +267,121 @@ def _ancestors(edges: list[ChainEdge], start_id: int) -> set[int]:
     return seen
 
 
-def waste_per_unit(amount: float) -> float:
-    """Rest oberhalb einer Einheit Ziel. Einsatz 1,1 ergibt 0,1 Abfall."""
-    return max(0.0, amount - 1.0)
-
-
-def _waste_target(edges: list[ChainEdge], product_id: int) -> int | None:
+def _waste_target(
+    nodes: dict[int, ChainNode], edges: list[ChainEdge], origin_id: int
+) -> int | None:
     for edge in edges:
-        if edge.kind == "waste" and edge.source_id == product_id:
-            return edge.target_id
+        if edge.kind != "waste" or edge.source_id != origin_id:
+            continue
+        target = nodes.get(edge.target_id)
+        if target is None:
+            continue
+        if target.type == "transport":
+            for hop in edges:
+                if hop.kind == "waste" and hop.source_id == target.id:
+                    return hop.target_id
+            continue
+        return target.id
     return None
+
+
+def process_recovery_ids(
+    process_id: int,
+    nodes: dict[int, ChainNode],
+    edges: list[ChainEdge],
+    combinations: list,
+) -> set[int]:
+    """Eine Verwertung je Prozess. Abfallkante und Mengen müssen dasselbe Ziel nennen."""
+    found: set[int] = set()
+    for edge in edges:
+        if edge.kind != "waste" or edge.source_id != process_id:
+            continue
+        target = nodes.get(edge.target_id)
+        if target is None:
+            continue
+        if target.type == "transport":
+            for hop in edges:
+                if hop.kind == "waste" and hop.source_id == target.id:
+                    dest = nodes.get(hop.target_id)
+                    if dest is not None and dest.type == "recovery":
+                        found.add(dest.id)
+            continue
+        if target.type == "recovery":
+            found.add(target.id)
+    for combo in combinations:
+        if combo.process_node_id != process_id:
+            continue
+        for amount in combo.amounts:
+            if amount.recovery_node_id is not None:
+                found.add(amount.recovery_node_id)
+    return found
+
+
+def _waste_hop(
+    nodes: dict[int, ChainNode], edges: list[ChainEdge], origin_id: int, recovery_id: int
+) -> ChainNode | None:
+    for edge in edges:
+        if edge.kind != "waste" or edge.source_id != origin_id:
+            continue
+        hop = nodes.get(edge.target_id)
+        if hop is None or hop.type != "transport":
+            continue
+        if any(item.kind == "waste" and item.source_id == hop.id and item.target_id == recovery_id for item in edges):
+            return hop
+    return None
+
+
+def _transport_into(
+    nodes: dict[int, ChainNode], edges: list[ChainEdge], source_id: int, process_id: int
+) -> ChainNode | None:
+    for edge in edges:
+        if edge.kind != "material" or edge.target_id != process_id:
+            continue
+        hop = nodes.get(edge.source_id)
+        if hop is None or hop.type != "transport":
+            continue
+        for incoming in edges:
+            if incoming.kind == "material" and incoming.target_id == hop.id and incoming.source_id == source_id:
+                return hop
+    return None
+
+
+def _stage_categories(
+    nodes: dict[int, ChainNode], edges: list[ChainEdge]
+) -> dict[int, list[tuple[ChainNode, str]]]:
+    incoming: dict[int, list[ChainEdge]] = defaultdict(list)
+    for edge in edges:
+        if edge.kind == "material":
+            incoming[edge.target_id].append(edge)
+    found: dict[int, list[tuple[ChainNode, str]]] = defaultdict(list)
+    seen: set[tuple[int, int, str]] = set()
+    for edge in edges:
+        if edge.kind == "waste":
+            continue
+        source = nodes.get(edge.source_id)
+        target = nodes.get(edge.target_id)
+        if source is None or target is None:
+            continue
+        if source.type == "process" and target.type == "category" and edge.kind == "energy":
+            key = (source.id, target.id, "credit")
+            if key not in seen:
+                seen.add(key)
+                found[source.id].append((target, "credit"))
+            continue
+        process = target if target.type == "process" else None
+        origin = source
+        kind = edge.kind
+        if source.type == "transport" and target.type == "process" and edge.kind == "material":
+            origin = _flow_source(nodes, incoming, source.id) or source
+            process = target
+        if process is None or origin is None or origin.type != "category":
+            continue
+        key = (process.id, origin.id, kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        found[process.id].append((origin, kind))
+    return found
 
 
 def share_key(category_id: int, dataset_id: int) -> str:
@@ -255,7 +445,7 @@ def calculate(
         skipped |= _ancestors(edges, node_id)
 
     amounts: dict[int, float] = {end.id: payload.end_amount}
-    links = product_links(by_id, edges)
+    links = product_links(by_id, edges, end.id)
     upstreams: dict[int, list[_ProductLink]] = defaultdict(list)
     sched_in: dict[int, int] = defaultdict(int)
     sched_out: dict[int, list[int]] = defaultdict(list)
@@ -297,7 +487,7 @@ def calculate(
         role_id: int = 0,
         role_fallback: str = "",
     ) -> None:
-        if amount <= 0:
+        if abs(amount) <= 1e-12:
             return
         if dataset_id is None:
             blockers.append(f"Bitte einen Datensatz wählen ({node.name}).")
@@ -341,16 +531,33 @@ def calculate(
             role_fallback="Ersatz",
         )
 
-    category_kind: dict[tuple[int, int], str] = {}
-    incoming_categories: dict[int, list[ChainNode]] = defaultdict(list)
-    for edge in edges:
-        source = by_id.get(edge.source_id)
-        target = by_id.get(edge.target_id)
-        if source is None or target is None or edge.kind == "waste":
+    stage_categories = _stage_categories(by_id, edges)
+    category_kind = {
+        (process_id, category.id): kind
+        for process_id, rows in stage_categories.items()
+        for category, kind in rows
+    }
+    process_share: dict[int, float] = {}
+    for process in nodes:
+        if process.type != "process":
             continue
-        if source.type == "category" and target.type == "process":
-            category_kind[(target.id, source.id)] = edge.kind
-            incoming_categories[target.id].append(source)
+        factor, share_error = allocation_factor(process.id, by_id, edges, end.id)
+        process_share[process.id] = factor
+        if share_error:
+            blockers.append(share_error)
+    transport_mass: dict[int, float] = defaultdict(float)
+    reported_recovery: set[int] = set()
+
+    def recovery_for(process_id: int, process_name: str) -> int | None:
+        ids = process_recovery_ids(process_id, by_id, edges, combinations)
+        if len(ids) > 1:
+            if process_id not in reported_recovery:
+                blockers.append(f"Prozess „{process_name}“ hat nur eine Verwertung.")
+                reported_recovery.add(process_id)
+            return None
+        if not ids:
+            return None
+        return next(iter(ids))
 
     def share_of(category_id: int, dataset_id: int) -> float:
         key = share_key(category_id, dataset_id)
@@ -368,7 +575,12 @@ def calculate(
         demand = amounts.get(process.id)
         if demand is None:
             continue
-        categories = incoming_categories.get(process.id, [])
+        if len(process_recovery_ids(process.id, by_id, edges, combinations)) > 1:
+            if process.id not in reported_recovery:
+                blockers.append(f"Prozess „{process.name}“ hat nur eine Verwertung.")
+                reported_recovery.add(process.id)
+            continue
+        categories = [category for category, _kind in stage_categories.get(process.id, [])]
         active_categories = []
         for category in categories:
             if category.datasets_differ:
@@ -437,13 +649,23 @@ def calculate(
                 if category is None or category.id not in share_maps:
                     continue
                 kind = category_kind.get((process.id, category.id), "material")
+                efficiency = amount.efficiency or 0.0
+                if kind != "material":
+                    efficiency = 1.0
+                elif efficiency <= 1e-12:
+                    blockers.append(f"Effizienz an {process.name} muss größer als 0 sein.")
+                    continue
+                soll = amount.input_amount
+                einsatz = deployment(soll, efficiency)
+                share = process_share.get(process.id, 1.0)
+                sign = -1.0 if kind == "credit" else 1.0
                 unit = category.unit
                 if category.datasets_differ:
                     portions = [(axis.get(category.id), 1.0)]
                 else:
                     portions = list(share_maps[category.id].items())
                 for dataset_id, portion in portions:
-                    qty = demand * amount.input_amount * weight * portion
+                    qty = sign * demand * einsatz * weight * portion * share
                     add_use(
                         category,
                         dataset_id,
@@ -452,15 +674,25 @@ def calculate(
                         f"combo:{combo.id}:{category.id}:{dataset_id}",
                         role_id=category.role_id or 0,
                     )
+                    if kind == "material":
+                        hop = _transport_into(by_id, edges, category.id, process.id)
+                        if hop and hop.id not in skipped and not (hop.optional and hop.id not in optional_on):
+                            transport_mass[hop.id] += abs(qty)
                 if kind != "material":
                     continue
-                waste_qty = demand * waste_per_unit(amount.input_amount) * weight
+                waste_qty = demand * material_waste(soll, efficiency) * weight * share
                 if waste_qty <= 1e-12:
                     continue
-                if amount.recovery_node_id is None:
-                    blockers.append(f"Verwertung fehlt für Abfall an {process.name}.")
+                recovery_id = recovery_for(process.id, process.name)
+                if recovery_id is None:
+                    if process.id not in reported_recovery:
+                        blockers.append(f"Verwertung fehlt für Abfall an {process.name}.")
+                        reported_recovery.add(process.id)
                 else:
-                    recovery_amounts[amount.recovery_node_id] += waste_qty
+                    recovery_amounts[recovery_id] += waste_qty
+                    hop = _waste_hop(by_id, edges, process.id, recovery_id)
+                    if hop and hop.id not in skipped and not (hop.optional and hop.id not in optional_on):
+                        transport_mass[hop.id] += waste_qty
 
     for link in links:
         downstream = by_id.get(link.downstream_id)
@@ -469,12 +701,14 @@ def calculate(
         demand = amounts.get(downstream.id)
         if demand is None:
             continue
-        waste_qty = demand * waste_per_unit(link.input_amount)
+        waste_qty = demand * material_waste(link.soll, link.efficiency) * process_share.get(downstream.id, 1.0)
         if waste_qty <= 1e-12:
             continue
-        recovery_id = _waste_target(edges, downstream.id)
+        recovery_id = recovery_for(downstream.id, downstream.name)
         if recovery_id is None:
-            blockers.append(f"Verwertung fehlt für Abfall an {downstream.name}.")
+            if downstream.id not in reported_recovery:
+                blockers.append(f"Verwertung fehlt für Abfall an {downstream.name}.")
+                reported_recovery.add(downstream.id)
         else:
             recovery_amounts[recovery_id] += waste_qty
 
@@ -491,21 +725,29 @@ def calculate(
             role_fallback="Verwertung",
         )
 
-    transport_mass: dict[int, float] = defaultdict(float)
+    material_incoming: dict[int, list[ChainEdge]] = defaultdict(list)
+    for edge in edges:
+        if edge.kind == "material":
+            material_incoming[edge.target_id].append(edge)
     for edge in edges:
         if edge.kind != "material":
             continue
         source = by_id.get(edge.source_id)
         target = by_id.get(edge.target_id)
-        if source is None or target is None:
+        if source is None or target is None or source.type != "transport":
             continue
-        if source.type == "transport" and target.type in {"product", "process"} and target.id not in skipped:
-            if source.optional and source.id not in optional_on:
-                continue
-            demand = amounts.get(target.id)
-            if demand is None:
-                continue
-            transport_mass[source.id] += demand * (edge.input_amount or 0.0)
+        if target.type not in {"product", "process"} or target.id in skipped:
+            continue
+        if source.optional and source.id not in optional_on:
+            continue
+        origin = _flow_source(by_id, material_incoming, source.id)
+        if origin is None or origin.type != "product":
+            continue
+        demand = amounts.get(target.id)
+        if demand is None:
+            continue
+        share = process_share.get(target.id, 1.0) if target.type == "process" else 1.0
+        transport_mass[source.id] += demand * deployment(edge.input_amount or 0.0, edge.efficiency or 1.0) * share
 
     for node_id, mass in transport_mass.items():
         node = by_id[node_id]

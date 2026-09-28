@@ -21,7 +21,7 @@ Web-Tool: Nutzer wählen ein Endprodukt und ggf. eine Kette, geben eine Menge ei
 | ID | Beschluss |
 |---|---|
 | K1 | Admin modelliert **Stufen mit Slots**, keinen freien Graphen wie in GaBi. |
-| K2 | Die Kette läuft nur **vorwärts**. Pro Knoten **höchstens eine** ausgehende Kante, **beliebig viele** eingehende. Keine Verzweigung (ein Zwischenprodukt geht nicht in zwei Endprodukte). |
+| K2 | Die Kette läuft **vorwärts** zum Endprodukt. Ein Prozess hat genau **ein** Produkt, das die Kette fortsetzt. Weitere Produkte sind **Nebenprodukte** ohne Folgekante. Transport steht zwischen Produkt oder Materialkategorie und Prozess, oder zwischen Prozess und Verwertung. |
 | K3 | Das **Zwischenprodukt fließt** in die nächste Stufe. Es ist **kein** Katalog-Dropdown. |
 | K4 | Der Nutzer arbeitet **von hinten**: zuerst Endprodukt → bei mehreren Pfaden die Kette → rekursiv nur noch **Blätter** wählbar (Ausgangsstoffe, Energie, Vergleichbares). |
 | K5 | Nutzer geben **eine Endmenge** ein. Alle anderen Mengen berechnet das Tool. Umrechnungen: zuerst Datenbank, sonst Admin-Default. |
@@ -30,6 +30,9 @@ Web-Tool: Nutzer wählen ein Endprodukt und ggf. eine Kette, geben eine Menge ei
 | K8 | Zusatz-Slots bekommen **keine eigenen kg**. Der Admin gibt die **Gesamtmenge der Kategorie** je Einheit Stufenausgang vor. Der Nutzer verteilt **Anteile in Prozent** (Summe **100 %**, sonst Blocker). |
 | K9 | Der Admin kann Slots als **optional** markieren. Optional ist **standardmäßig aus**. Einschalten nutzt Admin-Default und normale Datensatzwahl. |
 | K10 | Mengen, Ausbeuten und Wirkungszahlen ändert der Nutzer **nicht** im Rezept. Dafür legt er einen **eigenen Datensatz** an. |
+| K11 | Jeder Eingang hat eine **Sollmenge**. **Effizienz** gilt nur für Material: Einsatz = Sollmenge / Effizienz, Abfall = Sollmenge × (1 / Effizienz − 1). Energie hat immer 100 %, sie erzeugt keinen Abfall. |
+| K12 | Nebenprodukte gleicher Einheit teilen die Stufenlast nach der Menge. Bei abweichender Einheit setzt der Admin Anteile, Summe 100 %. Freigesetzte Energie ist eine Gutschrift und wird **vor** der Aufteilung abgezogen. |
+| K13 | Ein Prozess hat **eine** Verwertung. Aller Abfall dieser Stufe geht gemeinsam dorthin: Abfallmenge × ein Behandlungsdatensatz mit Inventar. Keine Energiekante an der Verwertung. Die Last gehört zur Stufe, bevor Nebenprodukte abgezogen werden. |
 
 ---
 
@@ -106,7 +109,7 @@ Web-Tool: Nutzer wählen ein Endprodukt und ggf. eine Kette, geben eine Menge ei
 
 ### Bewusst nicht im MVP
 
-- Freier Graph-Editor, Verzweigungen, Zyklen
+- Freier Graph-Editor, zweite Zielkette, Zyklen
 - Zwischenprodukt als Katalogwahl (außer Ersatz durch eigenen Datensatz)
 - Blackbox für das Endprodukt
 - Organisationen, Teilen von Konfigurationen oder Eigendaten
@@ -130,12 +133,16 @@ menge_end = Nutzereingabe in der Admin-Einheit des Endprodukts
 
 Für jede Stufe von hinten nach vorn:
   ausgang_stufe = (bei letzter Stufe) menge_end
-                  sonst berechneter Input der Folgestufe
-  für jeden aktiven Slot:
-    menge_slot = ausgang_stufe × admin_spezifische_menge
-                 bei mehreren Slots derselben Kategorie: × anteil_slot
-    faktor     = faktor_katalog oder faktor_eigendaten (Blackbox)
-    beitrag    = menge_slot × faktor   // je EF-3.1-Indikator; fehlend = weglassen
+                  sonst berechneter Einsatz der Folgestufe
+  einsatz   = bei Material: sollmenge / effizienz, bei Energie: sollmenge
+  abfall    = bei Material: sollmenge × (1 / effizienz − 1), bei Energie: 0
+  verwertung = eine Senke je Prozess; aller Abfall der Stufe geht dorthin
+  gutschrift = freigesetzte Energie × Faktor
+  stufenlast = Inputs + Transport + Verwertung − gutschrift
+  anteil    = 1, wenn kein Nebenprodukt
+              sonst Menge des fortgeführten Produkts / Summe der Produktmengen
+              oder der gesetzte Anteil bei abweichender Einheit
+  beitrag   = stufenlast × anteil   // je EF-3.1-Indikator; fehlend = weglassen
 
 Ergebnis(Indikator) = Summe aller Beiträge dieses Indikators
 ```
@@ -178,7 +185,7 @@ Vergleich, CSV-Export, eigene Datensätze und Selbstregistrierung können **dire
 
 | Nr. | Thema | Wahl |
 |---|---|---|
-| 1 | Admin-Editor | Stufen mit Slots; linear; 1 Ausgang, n Eingänge |
+| 1 | Admin-Editor | Stufen mit Slots; ein fortgeführtes Produkt, Nebenprodukte am Rand |
 | 2 | Stufenausgang | Zwischenprodukt fließt; Nutzer von hinten |
 | 3 | Einstieg | Endprodukt, dann Kette |
 | 4–5 | Mengen / eigene Werte | Eine Endmenge; sonst eigener Datensatz |

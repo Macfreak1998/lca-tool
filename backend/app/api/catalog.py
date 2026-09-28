@@ -60,6 +60,11 @@ def import_dataset(payload: CatalogImportIn, _admin: AdminUser, db: DbDep) -> Da
         meta, flows = parse_spold(path)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Datei konnte nicht gelesen werden: {exc}") from exc
+    if not flows:
+        raise HTTPException(
+            status_code=400,
+            detail="Dieser Datensatz hat kein Inventar. Koppelprodukte ohne Elementarflüsse werden nicht importiert.",
+        )
     if existing:
         dataset = existing
         dataset.name = meta["name"]

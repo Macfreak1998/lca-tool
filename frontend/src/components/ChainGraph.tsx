@@ -31,6 +31,7 @@ export type GraphEdge = {
   kind: EdgeKind;
   input_amount: number;
   efficiency: number;
+  allocation_share?: number | null;
 };
 
 const KIND_LABEL: Record<NodeType, string> = {
@@ -70,10 +71,12 @@ function edgeLabel(edge: GraphEdge, nodes: GraphNode[]) {
   if (edge.kind === "waste") return "Abfall";
   const source = nodes.find((node) => node.key === edge.source);
   const target = nodes.find((node) => node.key === edge.target);
-  if (source?.type === "category" || source?.type === "process") return edge.kind === "energy" ? "Energie" : "";
-  if (target?.type === "process" && edge.input_amount !== 1) return String(edge.input_amount);
+  if (edge.kind === "energy" && source?.type === "process") return "Gutschrift";
   if (edge.kind === "energy") return "Energie";
-  if (edge.input_amount !== 1 && source?.type === "product") return String(edge.input_amount);
+  if (source?.type === "process" && target?.type === "product" && edge.input_amount !== 1) {
+    return String(edge.input_amount);
+  }
+  if (target?.type === "process" && edge.efficiency !== 1) return `${Math.round(edge.efficiency * 100)} %`;
   return "";
 }
 

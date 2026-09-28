@@ -163,6 +163,7 @@ class EdgeIn(BaseModel):
     kind: str = "material"
     input_amount: float = 1.0
     efficiency: float = 1.0
+    allocation_share: float | None = None
 
 
 class CombinationAxisIn(BaseModel):
@@ -173,6 +174,7 @@ class CombinationAxisIn(BaseModel):
 class CombinationAmountIn(BaseModel):
     category_key: str
     input_amount: float = 0.0
+    efficiency: float = 1.0
     recovery_key: str | None = None
 
 
@@ -224,6 +226,7 @@ class EdgeOut(BaseModel):
     kind: str
     input_amount: float
     efficiency: float
+    allocation_share: float | None
 
 
 class CombinationAxisOut(BaseModel):
@@ -234,6 +237,7 @@ class CombinationAxisOut(BaseModel):
 class CombinationAmountOut(BaseModel):
     category_node_id: int
     input_amount: float
+    efficiency: float
     recovery_node_id: int | None
 
 

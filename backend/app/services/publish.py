@@ -6,7 +6,15 @@ from itertools import product as cartesian
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import Chain, Configuration, Dataset, Role
-from app.services.calculate import CalcInput, calculate, has_cycle, share_key
+from app.services.calculate import (
+    CalcInput,
+    allocation_factor,
+    calculate,
+    has_cycle,
+    material_waste,
+    process_recovery_ids,
+    share_key,
+)
 from app.services.units import same_unit, unit_mismatch_message
 
 
@@ -40,7 +48,6 @@ def validate_structure(chain: Chain) -> list[str]:
         errors.append("Die Kette enthält einen Zyklus.")
 
     by_id = {node.id: node for node in nodes}
-    waste_from = {edge.source_id for edge in edges if edge.kind == "waste"}
     kind_of: dict[tuple[int, int], str] = {}
     incoming: dict[int, list] = defaultdict(list)
     produced_by: dict[int, list] = defaultdict(list)
@@ -53,19 +60,21 @@ def validate_structure(chain: Chain) -> list[str]:
             continue
         if edge.input_amount < 0:
             errors.append(f"Menge der Kante nach „{target.name}“ darf nicht negativ sein.")
+        if edge.efficiency <= 0:
+            errors.append(f"Effizienz der Kante nach „{target.name}“ muss größer als 0 sein.")
         if edge.kind == "waste":
             continue
         if source.type == "category" and target.type == "process":
             kind_of[(target.id, source.id)] = edge.kind
             incoming[target.id].append(source)
-        if (
-            edge.kind == "material"
-            and edge.input_amount > 1
-            and target.type == "process"
-            and source.type in {"product", "transport"}
-            and target.id not in waste_from
-        ):
-            errors.append(f"Verwertung fehlt für Abfall an „{target.name}“.")
+        if source.type == "process" and target.type == "category" and edge.kind == "energy":
+            kind_of[(source.id, target.id)] = "credit"
+            incoming[source.id].append(target)
+        if source.type == "transport" and target.type == "process" and edge.kind == "material":
+            origin = _transport_origin(by_id, edges, source.id)
+            if origin is not None and origin.type == "category":
+                kind_of[(target.id, origin.id)] = "material"
+                incoming[target.id].append(origin)
         if edge.kind == "material" and source.type == "process" and target.type == "product":
             produced_by[target.id].append(source)
 
@@ -80,8 +89,12 @@ def validate_structure(chain: Chain) -> list[str]:
             and by_id.get(edge.target_id) is not None
             and by_id[edge.target_id].type == "product"
         ]
-        if len(outs) != 1:
-            errors.append(f"Prozess „{process.name}“ braucht genau ein Folgeprodukt.")
+        if not outs:
+            errors.append(f"Prozess „{process.name}“ braucht ein Folgeprodukt.")
+        elif functional:
+            _factor, share_error = allocation_factor(process.id, by_id, edges, functional[0].id)
+            if share_error:
+                errors.append(share_error)
 
     for product_id, producers in produced_by.items():
         if len(producers) > 1:
@@ -146,8 +159,26 @@ def validate_structure(chain: Chain) -> list[str]:
                 if amount.input_amount < 0:
                     errors.append(f"Mengen an „{process.name}“ dürfen nicht negativ sein.")
                 kind = kind_of.get((process.id, amount.category_node_id), "material")
-                if kind == "material" and amount.input_amount > 1 and amount.recovery_node_id is None:
-                    errors.append(f"Verwertung fehlt für Abfall an „{process.name}“.")
+                if kind == "material" and amount.efficiency <= 0:
+                    errors.append(f"Effizienz an „{process.name}“ muss größer als 0 sein.")
+        has_waste = any(
+            kind_of.get((process.id, amount.category_node_id), "material") == "material"
+            and material_waste(amount.input_amount, amount.efficiency) > 1e-12
+            for combo in combos
+            for amount in combo.amounts
+        ) or any(
+            edge.kind == "material"
+            and edge.target_id == process.id
+            and by_id.get(edge.source_id) is not None
+            and by_id[edge.source_id].type in {"product", "transport"}
+            and material_waste(edge.input_amount, edge.efficiency) > 1e-12
+            for edge in edges
+        )
+        recovery_ids = process_recovery_ids(process.id, by_id, edges, combinations)
+        if len(recovery_ids) > 1:
+            errors.append(f"Prozess „{process.name}“ hat nur eine Verwertung.")
+        elif has_waste and not recovery_ids:
+            errors.append(f"Verwertung fehlt für Abfall an „{process.name}“.")
 
         for category in categories:
             if category.datasets_differ or category.optional:
@@ -159,11 +190,17 @@ def validate_structure(chain: Chain) -> list[str]:
                 errors.append(f"Default-Anteile für „{category.name}“ müssen 100 % ergeben.")
 
     for node in nodes:
+        if node.type == "transport":
+            errors.extend(_transport_errors(node, edges, by_id))
         if node.type == "transport" and not node.optional:
             if node.dataset_id is None:
                 errors.append(f"Datensatz fehlt für Transport „{node.name}“.")
             if not node.distance_km or node.distance_km <= 0:
                 errors.append(f"Distanz fehlt für Transport „{node.name}“.")
+        if node.type == "recovery" and any(
+            edge.kind == "energy" and node.id in {edge.source_id, edge.target_id} for edge in edges
+        ):
+            errors.append(f"Verwertung „{node.name}“ hat keine Energiekante.")
         if node.type == "recovery" and node.dataset_id is None:
             referenced = any(
                 amount.recovery_node_id == node.id
@@ -172,6 +209,16 @@ def validate_structure(chain: Chain) -> list[str]:
             ) or any(edge.kind == "waste" and edge.target_id == node.id for edge in edges)
             if referenced:
                 errors.append(f"Datensatz fehlt für Verwertung „{node.name}“.")
+        elif node.type == "recovery" and node.dataset is not None:
+            referenced = any(
+                amount.recovery_node_id == node.id
+                for combo in combinations
+                for amount in combo.amounts
+            ) or any(edge.kind == "waste" and edge.target_id == node.id for edge in edges)
+            dataset = node.dataset
+            has_inventory = bool(dataset.exchanges) or any(row.value is not None for row in dataset.factors)
+            if referenced and not has_inventory:
+                errors.append(f"Datensatz der Verwertung „{node.name}“ hat kein Inventar.")
         if node.type == "category" and node.role_id is None:
             errors.append(f"Kategorie fehlt am Knoten „{node.name}“.")
         if node.type == "category" and node.datasets_differ and node.optional:
@@ -179,6 +226,39 @@ def validate_structure(chain: Chain) -> list[str]:
 
     errors.extend(_category_unit_errors(chain))
     return errors
+
+
+def _transport_origin(nodes: dict[int, object], edges: list, transport_id: int):
+    for edge in edges:
+        if edge.kind == "material" and edge.target_id == transport_id:
+            return nodes.get(edge.source_id)
+    return None
+
+
+def _transport_errors(node, edges: list, nodes: dict[int, object]) -> list[str]:
+    incoming = [edge for edge in edges if edge.target_id == node.id]
+    outgoing = [edge for edge in edges if edge.source_id == node.id]
+    if len(incoming) != 1 or len(outgoing) != 1:
+        return [f"Transport „{node.name}“ braucht genau eine Kante hinein und hinaus."]
+    arrived = incoming[0]
+    left = outgoing[0]
+    if arrived.kind == "energy" or left.kind == "energy" or arrived.kind != left.kind:
+        return [f"Energie läuft nicht über Transport „{node.name}“."]
+    source = nodes.get(arrived.source_id)
+    target = nodes.get(left.target_id)
+    if source is None or target is None:
+        return [f"Transport „{node.name}“ steht an einer ungültigen Stelle."]
+    material_forward = (
+        arrived.kind == "material"
+        and target.type == "process"
+        and (source.type == "product" or source.type == "category")
+    )
+    waste_forward = (
+        arrived.kind == "waste" and source.type == "process" and target.type == "recovery"
+    )
+    if material_forward or waste_forward:
+        return []
+    return [f"Transport „{node.name}“ steht an einer ungültigen Stelle."]
 
 
 def _category_unit_errors(chain: Chain) -> list[str]:

@@ -226,10 +226,20 @@ export function RechnenPage() {
             );
             const product = chain.nodes.find((node) => node.id === productEdge?.target_id);
             if (product && (skipped.has(product.id) || payload.replaced_nodes[String(product.id)])) return null;
-            const categories = chain.edges
-              .filter((edge) => edge.target_id === process.id && edge.kind !== "waste")
-              .map((edge) => chain.nodes.find((node) => node.id === edge.source_id && node.type === "category"))
-              .filter((node): node is NonNullable<typeof node> => Boolean(node));
+            const categories = chain.nodes.filter((node) => {
+              if (node.type !== "category") return false;
+              return chain.edges.some((edge) => {
+                if (edge.kind === "waste") return false;
+                if (edge.kind === "energy" && edge.source_id === process.id && edge.target_id === node.id) return true;
+                if (edge.source_id !== node.id) return false;
+                if (edge.target_id === process.id) return true;
+                const hop = chain.nodes.find((item) => item.id === edge.target_id);
+                if (hop?.type !== "transport") return false;
+                return chain.edges.some(
+                  (next) => next.source_id === hop.id && next.target_id === process.id && next.kind === "material",
+                );
+              });
+            });
             const combos = chain.combinations.filter((combo) => combo.process_node_id === process.id);
             const named = (datasetId: number | null) => {
               const dataset = [...catalog, ...own].find((item) => item.id === datasetId);
@@ -241,6 +251,27 @@ export function RechnenPage() {
                   {process.name}
                   {product ? ` → ${product.name}` : ""}
                 </h2>
+                {chain.edges
+                  .filter((edge) => edge.kind === "material" && edge.target_id === process.id && edge.efficiency > 0 && edge.efficiency !== 1)
+                  .map((edge) => {
+                    const source = chain.nodes.find((node) => node.id === edge.source_id);
+                    const origin =
+                      source?.type === "transport"
+                        ? chain.nodes.find((node) =>
+                            chain.edges.some(
+                              (item) => item.kind === "material" && item.target_id === source.id && item.source_id === node.id && node.type === "product",
+                            ),
+                          )
+                        : source;
+                    const soll = edge.input_amount;
+                    const waste = Math.max(0, soll * (1 / edge.efficiency - 1));
+                    return (
+                      <p key={edge.id} className="text-sm text-slate-600">
+                        {origin?.name || source?.name} · Sollmenge {soll} · {Math.round(edge.efficiency * 100)} % · Abfall{" "}
+                        {Math.round((waste + Number.EPSILON) * 1000) / 1000} {origin?.unit || "kg"} je 1 {product?.unit || chain.end_unit}
+                      </p>
+                    );
+                  })}
                 {categories.map((category) => {
                   const optional = category.optional && !category.datasets_differ;
                   const on = !optional || payload.optional_on.includes(category.id);
@@ -323,18 +354,23 @@ export function RechnenPage() {
                             </td>
                             {categories.map((category) => {
                               const amount = combo.amounts.find((item) => item.category_node_id === category.id);
-                              const value = amount?.input_amount ?? 0;
+                              const soll = amount?.input_amount ?? 0;
                               const material = chain.edges.some(
-                                (edge) => edge.source_id === category.id && edge.target_id === process.id && edge.kind === "material",
+                                (edge) => edge.source_id === category.id && edge.kind === "material" && (edge.target_id === process.id || chain.nodes.some((node) => node.id === edge.target_id && node.type === "transport")),
                               );
+                              const credit = chain.edges.some(
+                                (edge) => edge.source_id === process.id && edge.target_id === category.id && edge.kind === "energy",
+                              );
+                              const efficiency = material ? (amount?.efficiency ?? 1) : 1;
+                              const einsatz = material && efficiency > 0 ? soll / efficiency : soll;
+                              const waste = material && efficiency > 0 ? Math.max(0, soll * (1 / efficiency - 1)) : 0;
                               const perUnit = product?.unit || chain.end_unit;
                               return (
                                 <td key={category.id} className="py-1 pr-3">
-                                  {value} {category.unit} je 1 {perUnit}
-                                  {material && value > 0 ? ` · ${Math.round((1 / value) * 100)} %` : ""}
-                                  {material && value > 1
-                                    ? ` · Abfall ${Math.round((value - 1 + Number.EPSILON) * 1000) / 1000}`
-                                    : ""}
+                                  {Math.round((einsatz + Number.EPSILON) * 1000) / 1000} {category.unit} je 1 {perUnit}
+                                  {credit ? " · Gutschrift" : ""}
+                                  {material && efficiency !== 1 ? ` · ${Math.round(efficiency * 100)} %` : ""}
+                                  {waste > 1e-9 ? ` · Abfall ${Math.round((waste + Number.EPSILON) * 1000) / 1000}` : ""}
                                 </td>
                               );
                             })}
@@ -478,30 +514,41 @@ function ResultView({ result, indicators }: { result: CalcResult; indicators: In
         </tbody>
       </table>
       <h3 className="mb-2 mt-6 font-semibold">Beiträge</h3>
-      <table className="w-full text-left text-sm">
-        <thead>
-          <tr className="border-b text-slate-500">
-            <th className="py-2">Knoten</th>
-            <th>Kategorie</th>
-            <th>Datensatz</th>
-            <th>Indikator</th>
-            <th>Beitrag</th>
-          </tr>
-        </thead>
-        <tbody>
-          {result.contributions
-            .filter((row) => row.indicator_id === "climate_change")
-            .map((row) => (
-              <tr key={`${row.use_key}-${row.indicator_id}`} className="border-b last:border-0">
-                <td className="py-2">{row.node_name}</td>
-                <td>{row.role_label}</td>
-                <td>{row.dataset_name}</td>
-                <td>Klimawandel</td>
-                <td>{row.value.toPrecision(4)}</td>
-              </tr>
-            ))}
-        </tbody>
-      </table>
+      {indicators
+        .filter((item) => result.contributions.some((row) => row.indicator_id === item.id))
+        .map((item) => (
+          <div key={item.id} className="mb-6">
+            <h4 className="mb-1 text-sm font-semibold">
+              {item.label} ({item.unit})
+            </h4>
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b text-slate-500">
+                  <th className="py-2">Knoten</th>
+                  <th>Kategorie</th>
+                  <th>Datensatz</th>
+                  <th>Menge</th>
+                  <th>Beitrag</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.contributions
+                  .filter((row) => row.indicator_id === item.id)
+                  .map((row) => (
+                    <tr key={`${row.use_key}-${row.indicator_id}`} className="border-b last:border-0">
+                      <td className="py-2">{row.node_name}</td>
+                      <td>{row.role_label}</td>
+                      <td>{row.dataset_name}</td>
+                      <td>
+                        {row.amount.toPrecision(4)} {row.unit}
+                      </td>
+                      <td>{row.value.toPrecision(4)}</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
     </div>
   );
 }

@@ -93,6 +93,7 @@ def chain_out(chain: Chain) -> ChainOut:
                 kind=edge.kind,
                 input_amount=edge.input_amount,
                 efficiency=edge.efficiency,
+                allocation_share=edge.allocation_share,
             )
             for edge in chain.edges
         ],
@@ -111,6 +112,7 @@ def chain_out(chain: Chain) -> ChainOut:
                     CombinationAmountOut(
                         category_node_id=amount.category_node_id,
                         input_amount=amount.input_amount,
+                        efficiency=amount.efficiency,
                         recovery_node_id=amount.recovery_node_id,
                     )
                     for amount in combo.amounts

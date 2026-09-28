@@ -358,7 +358,8 @@ def test_chain_graph_roundtrip():
                     "amounts": [
                         {
                             "category_key": "starch",
-                            "input_amount": 1.2,
+                            "input_amount": 1,
+                            "efficiency": 1 / 1.2,
                             "recovery_key": "waste",
                         }
                     ],
@@ -372,7 +373,8 @@ def test_chain_graph_roundtrip():
     assert saved.status_code == 200, saved.text
     body = saved.json()
     assert len(body["nodes"]) == 4
-    assert body["combinations"][0]["amounts"][0]["input_amount"] == 1.2
+    assert body["combinations"][0]["amounts"][0]["input_amount"] == 1
+    assert abs(body["combinations"][0]["amounts"][0]["efficiency"] - (1 / 1.2)) < 1e-9
     published = client.post(f"/api/chains/{chain['id']}/publish")
     assert published.status_code == 200, published.text
     result = client.post(
@@ -380,5 +382,41 @@ def test_chain_graph_roundtrip():
         json={"chain_id": chain["id"], "end_amount": 1, "selections": {}, "shares": {}, "optional_on": []},
     )
     assert result.status_code == 200, result.text
-    # 1,2 kg Stärke × 1,5 und Abfall (1,2 − 1) × 2
+    # Einsatz 1,2 kg Stärke × 1,5 und Abfall 0,2 × 2
     assert result.json()["totals"]["climate_change"] == 1.2 * 1.5 + (1.2 - 1) * 2
+
+
+def test_import_rejects_dataset_without_inventory(tmp_path, monkeypatch):
+    from app.config import settings
+
+    archive = tmp_path / "archive"
+    (archive / "datasets").mkdir(parents=True)
+    (archive / "datasets" / "empty.spold").write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<ecoSpold xmlns="http://www.EcoInvent.org/EcoSpold02">
+  <childActivityDataset>
+    <activityDescription>
+      <activity id="aaa" activityName="treatment of waste plastic, municipal incineration">
+        <activityName>treatment of waste plastic, municipal incineration</activityName>
+      </activity>
+      <geography><shortname>GLO</shortname></geography>
+    </activityDescription>
+    <flowData>
+      <intermediateExchange intermediateExchangeId="elec" amount="1.0">
+        <name>electricity, for reuse in municipal waste incineration only</name>
+        <unitName>kWh</unitName>
+        <outputGroup>0</outputGroup>
+      </intermediateExchange>
+    </flowData>
+  </childActivityDataset>
+</ecoSpold>
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "archive_path", str(archive))
+    client, _db = _client()
+    _login(client)
+    role = client.post("/api/roles", json={"label": "Abfall"}).json()
+    response = client.post("/api/catalog/import", json={"filename": "empty.spold", "role_id": role["id"]})
+    assert response.status_code == 400
+    assert "Inventar" in response.text

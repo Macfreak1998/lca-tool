@@ -16,6 +16,7 @@ type DraftNode = GraphNode & {
 type DraftAmount = {
   category_key: string;
   input_amount: number;
+  efficiency: number;
   recovery_key: string | null;
 };
 
@@ -36,7 +37,33 @@ type DraftShare = {
   default_share: number;
 };
 
-type DraftEdge = GraphEdge & { id?: number };
+type DraftEdge = GraphEdge & { id?: number; allocation_share: number | null };
+
+function reaches(start: string, goal: string, edges: DraftEdge[]): boolean {
+  if (start === goal) return true;
+  const outgoing = new Map<string, string[]>();
+  edges.forEach((edge) => {
+    if (edge.kind === "waste") return;
+    const list = outgoing.get(edge.source) || [];
+    list.push(edge.target);
+    outgoing.set(edge.source, list);
+  });
+  const seen = new Set<string>();
+  const stack = [start];
+  while (stack.length) {
+    const key = stack.pop() as string;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (key === goal) return true;
+    stack.push(...(outgoing.get(key) || []));
+  }
+  return false;
+}
+
+function materialWaste(soll: number, efficiency: number): number {
+  if (efficiency <= 0 || soll <= 0) return 0;
+  return Math.max(0, soll * (1 / efficiency - 1));
+}
 
 const TYPE_LABEL: Record<NodeType, string> = {
   category: "Kategorie",
@@ -104,6 +131,7 @@ function toDraft(chain: Chain) {
     kind: edge.kind,
     input_amount: edge.input_amount,
     efficiency: edge.efficiency,
+    allocation_share: edge.allocation_share,
   }));
   const combinations: DraftCombination[] = chain.combinations.map((combo) => {
     const axes = combo.axes
@@ -116,6 +144,7 @@ function toDraft(chain: Chain) {
       amounts: combo.amounts.map((amount) => ({
         category_key: nodeKey(amount.category_node_id),
         input_amount: amount.input_amount,
+        efficiency: amount.efficiency ?? 1,
         recovery_key: amount.recovery_node_id ? nodeKey(amount.recovery_node_id) : null,
       })),
     };
@@ -165,10 +194,22 @@ export function ChainEditorPage() {
     setCombinations((current) => {
       const next: DraftCombination[] = [];
       for (const process of nodes.filter((node) => node.type === "process")) {
-        const categories = edges
+        const incoming = edges
           .filter((edge) => edge.target === process.key && edge.kind !== "waste")
-          .map((edge) => nodes.find((node) => node.key === edge.source && node.type === "category"))
+          .flatMap((edge) => {
+            const source = nodes.find((node) => node.key === edge.source);
+            if (source?.type === "category") return [source];
+            if (source?.type !== "transport" || edge.kind !== "material") return [];
+            return edges
+              .filter((item) => item.target === source.key && item.kind === "material")
+              .map((item) => nodes.find((node) => node.key === item.source && node.type === "category"))
+              .filter((node): node is DraftNode => Boolean(node));
+          });
+        const credits = edges
+          .filter((edge) => edge.source === process.key && edge.kind === "energy")
+          .map((edge) => nodes.find((node) => node.key === edge.target && node.type === "category"))
           .filter((node): node is DraftNode => Boolean(node));
+        const categories = [...incoming, ...credits.filter((node) => !incoming.some((item) => item.key === node.key))];
         const differing = categories.filter((node) => node.datasets_differ);
         const lists = differing.map((category) =>
           roleDatasets(category.role_id).map((dataset) => ({ category_key: category.key, dataset_id: dataset.id })),
@@ -189,6 +230,7 @@ export function ChainEditorPage() {
               return {
                 category_key: category.key,
                 input_amount: kept?.input_amount ?? (category.datasets_differ ? 0 : copied?.input_amount ?? 0),
+                efficiency: kept?.efficiency ?? copied?.efficiency ?? 1,
                 recovery_key: kept?.recovery_key ?? null,
               };
             }),
@@ -206,6 +248,7 @@ export function ChainEditorPage() {
               (amount, amountIndex) =>
                 amount.category_key === other.amounts[amountIndex].category_key &&
                 amount.input_amount === other.amounts[amountIndex].input_amount &&
+                amount.efficiency === other.amounts[amountIndex].efficiency &&
                 amount.recovery_key === other.amounts[amountIndex].recovery_key,
             )
           );
@@ -219,15 +262,26 @@ export function ChainEditorPage() {
         if (edge.kind === "waste") continue;
         const source = nodes.find((node) => node.key === edge.source);
         const target = nodes.find((node) => node.key === edge.target);
-        if (!source || source.type !== "category" || !target || target.type !== "process") continue;
-        const rows = roleDatasets(source.role_id);
+        const category = (() => {
+          if (source?.type === "category" && target?.type === "process") return source;
+          if (source?.type === "process" && target?.type === "category" && edge.kind === "energy") return target;
+          if (source?.type === "category" && target?.type === "transport" && edge.kind === "material") {
+            const onwards = edges.some(
+              (item) => item.source === target.key && item.kind === "material" && nodes.some((node) => node.key === item.target && node.type === "process"),
+            );
+            return onwards ? source : null;
+          }
+          return null;
+        })();
+        if (!category) continue;
+        const rows = roleDatasets(category.role_id);
         rows.forEach((dataset) => {
-          const key = `${source.key}:${dataset.id}`;
+          const key = `${category.key}:${dataset.id}`;
           if (seen.has(key)) return;
           seen.add(key);
-          const existing = current.find((share) => share.category_key === source.key && share.dataset_id === dataset.id);
+          const existing = current.find((share) => share.category_key === category.key && share.dataset_id === dataset.id);
           needed.push({
-            category_key: source.key,
+            category_key: category.key,
             dataset_id: dataset.id,
             default_share: existing?.default_share ?? (rows.length === 1 ? 1 : 0),
           });
@@ -300,6 +354,84 @@ export function ChainEditorPage() {
     );
   }
 
+  function materialInput(processKey: string, categoryKey: string): boolean {
+    return edges.some((edge) => {
+      if (edge.source !== categoryKey || edge.kind !== "material") return false;
+      if (edge.target === processKey) return true;
+      const hop = nodes.find((node) => node.key === edge.target);
+      return (
+        hop?.type === "transport" &&
+        edges.some((next) => next.source === hop.key && next.target === processKey && next.kind === "material")
+      );
+    });
+  }
+
+  function processHasWaste(processKey: string): boolean {
+    const fromAmounts = combinations.some(
+      (combo) =>
+        combo.process_key === processKey &&
+        combo.amounts.some(
+          (amount) => materialInput(processKey, amount.category_key) && materialWaste(amount.input_amount, amount.efficiency) > 1e-12,
+        ),
+    );
+    const fromEdges = edges.some((edge) => {
+      if (edge.kind !== "material" || edge.target !== processKey) return false;
+      const source = nodes.find((node) => node.key === edge.source);
+      if (source?.type !== "product" && source?.type !== "transport") return false;
+      return materialWaste(edge.input_amount, edge.efficiency) > 1e-12;
+    });
+    return fromAmounts || fromEdges;
+  }
+
+  function recoveryKeyOf(processKey: string): string | null {
+    const direct = edges.find((edge) => edge.kind === "waste" && edge.source === processKey);
+    if (direct) {
+      const target = nodes.find((node) => node.key === direct.target);
+      if (target?.type === "recovery") return target.key;
+      if (target?.type === "transport") {
+        const next = edges.find((edge) => edge.kind === "waste" && edge.source === target.key);
+        if (next) return next.target;
+      }
+    }
+    for (const combo of combinations) {
+      if (combo.process_key !== processKey) continue;
+      const amount = combo.amounts.find((item) => item.recovery_key);
+      if (amount?.recovery_key) return amount.recovery_key;
+    }
+    return null;
+  }
+
+  function setProcessRecovery(processKey: string, recoveryKey: string | null) {
+    setCombinations((current) =>
+      current.map((combo) => {
+        if (combo.process_key !== processKey) return combo;
+        return {
+          ...combo,
+          amounts: combo.amounts.map((amount) => ({
+            ...amount,
+            recovery_key: materialInput(processKey, amount.category_key) ? recoveryKey : null,
+          })),
+        };
+      }),
+    );
+    setEdges((current) => {
+      const kept = current.filter((edge) => !(edge.kind === "waste" && edge.source === processKey));
+      if (!recoveryKey) return kept;
+      return [
+        ...kept,
+        {
+          key: `e-${Date.now()}`,
+          source: processKey,
+          target: recoveryKey,
+          kind: "waste",
+          input_amount: 1,
+          efficiency: 1,
+          allocation_share: null,
+        },
+      ];
+    });
+  }
+
   function removeNode(key: string) {
     const node = nodes.find((item) => item.key === key);
     if (!node || node.is_functional) return;
@@ -315,8 +447,9 @@ export function ChainEditorPage() {
     const to = nodes.find((node) => node.key === target);
     if (!from || !to || source === target) return;
     let kind: EdgeKind = "material";
-    if (to.type === "recovery") kind = "waste";
-    else if (from.type === "category" && from.name.toLowerCase().includes("energie")) kind = "energy";
+    if (to.type === "recovery" || from.type === "recovery") kind = "waste";
+    else if (from.type === "process" && to.type === "category") kind = "energy";
+    else if (from.type === "category" && to.type === "process" && from.name.toLowerCase().includes("energie")) kind = "energy";
     setEdges((current) => [
       ...current,
       {
@@ -326,6 +459,7 @@ export function ChainEditorPage() {
         kind,
         input_amount: 1,
         efficiency: 1,
+        allocation_share: null,
       },
     ]);
   }
@@ -349,7 +483,9 @@ export function ChainEditorPage() {
       if (rows.every((row) => sameUnit(row.unit, first))) return first;
       return node.unit;
     }
-    const energy = edges.some((edge) => edge.source === node.key && edge.kind === "energy");
+    const energy = edges.some(
+      (edge) => edge.kind === "energy" && (edge.source === node.key || edge.target === node.key),
+    );
     if (energy && (!node.unit.trim() || sameUnit(node.unit, "kg"))) return "kWh";
     return node.unit || "kg";
   }
@@ -404,6 +540,7 @@ export function ChainEditorPage() {
           kind: edge.kind,
           input_amount: edge.input_amount,
           efficiency: edge.efficiency,
+          allocation_share: edge.allocation_share,
         })),
         combinations: combinations.map((combo) => ({
           process_key: combo.process_key,
@@ -658,18 +795,21 @@ export function ChainEditorPage() {
                             )?.unit ||
                             chain?.end_unit ||
                             "";
-                          const material = edges.some(
+                          const material = materialInput(selectedNode.key, amount.category_key);
+                          const credit = edges.some(
                             (edge) =>
-                              edge.source === amount.category_key &&
-                              edge.target === selectedNode.key &&
-                              edge.kind === "material",
+                              edge.source === selectedNode.key &&
+                              edge.target === amount.category_key &&
+                              edge.kind === "energy",
                           );
-                          const waste = Math.max(0, Math.round((amount.input_amount - 1) * 1000) / 1000);
-                          const efficiency = amount.input_amount > 0 ? Math.round((1 / amount.input_amount) * 100) : 0;
+                          const efficiency = amount.efficiency || 0;
+                          const einsatz = efficiency > 0 ? amount.input_amount / efficiency : 0;
+                          const waste = material ? materialWaste(amount.input_amount, efficiency) : 0;
                           return (
                             <div key={amount.category_key} className="space-y-1">
                               <label className="block text-xs">
                                 {category ? categoryTitle(category, roles) : "Kategorie"}
+                                {credit ? " · Gutschrift" : ""}
                                 {category ? ` (${unitPreview(category)} je 1 ${productUnit})` : ""}
                                 <input
                                   className="input"
@@ -682,39 +822,60 @@ export function ChainEditorPage() {
                                   }
                                 />
                               </label>
+                              {material && (
+                                <label className="block text-xs">
+                                  Effizienz (1 = 100 %)
+                                  <input
+                                    className="input"
+                                    type="number"
+                                    step="any"
+                                    min={0}
+                                    value={amount.efficiency}
+                                    onChange={(e) =>
+                                      patchAmount(combo.key, amount.category_key, { efficiency: Number(e.target.value) })
+                                    }
+                                  />
+                                </label>
+                              )}
                               {category &&
                                 unitWarnings(category).map((warning) => (
                                   <p key={warning} className="text-xs text-red-700">
                                     {warning}
                                   </p>
                                 ))}
-                              {material && (
-                                <p className="text-xs text-slate-500">
-                                  Effizienz {efficiency} % · Abfall {formatQuantity(waste)}
-                                </p>
-                              )}
-                              {material && waste > 0 && (
-                                <select
-                                  className="input"
-                                  value={amount.recovery_key || ""}
-                                  onChange={(e) =>
-                                    patchAmount(combo.key, amount.category_key, { recovery_key: e.target.value || null })
-                                  }
-                                >
-                                  <option value="">Verwertung</option>
-                                  {recoveries.map((node) => (
-                                    <option key={node.key} value={node.key}>
-                                      {node.name}
-                                    </option>
-                                  ))}
-                                </select>
-                              )}
+                              <p className="text-xs text-slate-500">
+                                {material
+                                  ? `Einsatz ${formatQuantity(einsatz)} · Abfall ${formatQuantity(waste)}`
+                                  : credit
+                                    ? "wird abgezogen"
+                                    : "Energie mit 100 %"}
+                              </p>
                             </div>
                           );
                         })}
                       </div>
                     ))}
                   </div>
+                  {processHasWaste(selectedNode.key) && (
+                    <label className="block text-sm">
+                      Verwertung des Abfalls
+                      <select
+                        className="input mt-1"
+                        value={recoveryKeyOf(selectedNode.key) || ""}
+                        onChange={(e) => setProcessRecovery(selectedNode.key, e.target.value || null)}
+                      >
+                        <option value="">Verwertung wählen</option>
+                        {recoveries.map((node) => (
+                          <option key={node.key} value={node.key}>
+                            {node.name}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="mt-1 block text-xs text-slate-500">
+                        Alle übrigen Stoffe dieses Prozesses gehen in diese Verwertung.
+                      </span>
+                    </label>
+                  )}
                 </div>
               )}
               {!selectedNode.is_functional && (
@@ -742,28 +903,114 @@ export function ChainEditorPage() {
               {nodes.find((node) => node.key === selectedEdge.source)?.type === "category" && (
                 <p className="text-sm text-slate-600">Die Menge steht in den Kombinationen des Prozesses.</p>
               )}
-              {nodes.find((node) => node.key === selectedEdge.source)?.type === "process" && (
-                <p className="text-sm text-slate-600">Der Prozess erzeugt eine Einheit des Folgeprodukts.</p>
-              )}
-              {selectedEdge.kind === "material" &&
-                nodes.find((node) => node.key === selectedEdge.source)?.type === "product" &&
-                nodes.find((node) => node.key === selectedEdge.target)?.type === "process" && (
-                  <label className="block text-sm">
-                    Menge je Einheit Ziel
-                    <input
-                      className="input mt-1"
-                      type="number"
-                      step="any"
-                      min={0}
-                      value={selectedEdge.input_amount}
-                      onChange={(e) => patchEdge(selectedEdge.key, { input_amount: Number(e.target.value) })}
-                    />
-                    <span className="mt-1 block text-xs text-slate-500">
-                      Effizienz {selectedEdge.input_amount > 0 ? Math.round((1 / selectedEdge.input_amount) * 100) : 0} % · Abfall{" "}
-                      {formatQuantity(Math.max(0, selectedEdge.input_amount - 1))}
-                    </span>
-                  </label>
+              {nodes.find((node) => node.key === selectedEdge.target)?.type === "category" &&
+                selectedEdge.kind === "energy" && (
+                  <p className="text-sm text-slate-600">Gutschrift. Die Menge steht in den Kombinationen des Prozesses.</p>
                 )}
+              {(() => {
+                const source = nodes.find((node) => node.key === selectedEdge.source);
+                const target = nodes.find((node) => node.key === selectedEdge.target);
+                const functional = nodes.find((node) => node.is_functional);
+                const byproduct =
+                  source?.type === "process" &&
+                  target?.type === "product" &&
+                  selectedEdge.kind === "material" &&
+                  functional != null &&
+                  !reaches(target.key, functional.key, edges);
+                const flowIntoProcess =
+                  selectedEdge.kind === "material" &&
+                  target?.type === "process" &&
+                  (source?.type === "product" || source?.type === "transport");
+                if (source?.type === "process" && target?.type === "product" && !byproduct) {
+                  const unitsDiffer = edges.some((edge) => {
+                    if (edge.source !== source.key || edge.kind !== "material" || edge.key === selectedEdge.key) return false;
+                    const other = nodes.find((node) => node.key === edge.target);
+                    return other?.type === "product" && other.unit !== target.unit;
+                  });
+                  return (
+                    <>
+                      <p className="text-sm text-slate-600">Der Prozess erzeugt eine Einheit dieses Produkts.</p>
+                      {unitsDiffer && (
+                        <label className="block text-sm">
+                          Anteil (Summe der Produktausgänge = 1)
+                          <input
+                            className="input mt-1"
+                            type="number"
+                            step="any"
+                            min={0}
+                            value={selectedEdge.allocation_share ?? ""}
+                            onChange={(e) =>
+                              patchEdge(selectedEdge.key, {
+                                allocation_share: e.target.value === "" ? null : Number(e.target.value),
+                              })
+                            }
+                          />
+                        </label>
+                      )}
+                    </>
+                  );
+                }
+                if (!byproduct && !flowIntoProcess) return null;
+                const waste = flowIntoProcess ? materialWaste(selectedEdge.input_amount, selectedEdge.efficiency) : 0;
+                const einsatz =
+                  selectedEdge.efficiency > 0 ? selectedEdge.input_amount / selectedEdge.efficiency : 0;
+                const unitsDiffer =
+                  byproduct &&
+                  source?.type === "process" &&
+                  edges.some((edge) => {
+                    if (edge.source !== source.key || edge.kind !== "material" || edge.key === selectedEdge.key) return false;
+                    const other = nodes.find((node) => node.key === edge.target);
+                    return other?.type === "product" && other.unit !== target?.unit;
+                  });
+                return (
+                  <>
+                    <label className="block text-sm">
+                      {byproduct ? "Menge je Einheit des fortgeführten Produkts" : "Sollmenge je Einheit Ziel"}
+                      <input
+                        className="input mt-1"
+                        type="number"
+                        step="any"
+                        min={0}
+                        value={selectedEdge.input_amount}
+                        onChange={(e) => patchEdge(selectedEdge.key, { input_amount: Number(e.target.value) })}
+                      />
+                    </label>
+                    {flowIntoProcess && (
+                      <label className="block text-sm">
+                        Effizienz (1 = 100 %)
+                        <input
+                          className="input mt-1"
+                          type="number"
+                          step="any"
+                          min={0}
+                          value={selectedEdge.efficiency}
+                          onChange={(e) => patchEdge(selectedEdge.key, { efficiency: Number(e.target.value) })}
+                        />
+                        <span className="mt-1 block text-xs text-slate-500">
+                          Einsatz {formatQuantity(einsatz)} · Abfall {formatQuantity(waste)}
+                        </span>
+                      </label>
+                    )}
+                    {unitsDiffer && (
+                      <label className="block text-sm">
+                        Anteil (Summe der Produktausgänge = 1)
+                        <input
+                          className="input mt-1"
+                          type="number"
+                          step="any"
+                          min={0}
+                          value={selectedEdge.allocation_share ?? ""}
+                          onChange={(e) =>
+                            patchEdge(selectedEdge.key, {
+                              allocation_share: e.target.value === "" ? null : Number(e.target.value),
+                            })
+                          }
+                        />
+                      </label>
+                    )}
+                  </>
+                );
+              })()}
               <button
                 className="text-sm text-red-700 underline"
                 type="button"

@@ -61,12 +61,14 @@ export type ChainEdge = {
   kind: EdgeKind;
   input_amount: number;
   efficiency: number;
+  allocation_share: number | null;
 };
 
 export type CombinationAxis = { category_node_id: number; dataset_id: number | null };
 export type CombinationAmount = {
   category_node_id: number;
   input_amount: number;
+  efficiency: number;
   recovery_node_id: number | null;
 };
 export type ChainCombination = {

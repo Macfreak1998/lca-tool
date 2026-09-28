@@ -45,6 +45,19 @@ def _load_chain(db, chain_id: int) -> Chain:
     return chain
 
 
+def _is_energy_category(category: ChainNode, process: ChainNode, edges, key_to_node: dict[str, ChainNode]) -> bool:
+    for edge in edges:
+        if edge.kind != "energy":
+            continue
+        source = key_to_node.get(edge.source_key)
+        target = key_to_node.get(edge.target_key)
+        if source is None or target is None:
+            continue
+        if {source.id, target.id} == {category.id, process.id}:
+            return True
+    return False
+
+
 def _apply_graph(db, chain: Chain, payload: ChainUpdateIn) -> None:
     if payload.nodes is None:
         return
@@ -109,7 +122,8 @@ def _apply_graph(db, chain: Chain, payload: ChainUpdateIn) -> None:
                 target_id=target.id,
                 kind=item.kind,
                 input_amount=item.input_amount,
-                efficiency=item.efficiency,
+                efficiency=item.efficiency if item.efficiency > 0 else 1.0,
+                allocation_share=item.allocation_share,
             )
         )
     for item in payload.combinations or []:
@@ -134,12 +148,14 @@ def _apply_graph(db, chain: Chain, payload: ChainUpdateIn) -> None:
             category = key_to_node.get(amount.category_key)
             if category is None:
                 raise HTTPException(status_code=400, detail="Eine Menge verweist auf eine fehlende Kategorie.")
-            recovery = key_to_node.get(amount.recovery_key) if amount.recovery_key else None
+            energy = _is_energy_category(category, process, payload.edges or [], key_to_node)
+            recovery = None if energy or not amount.recovery_key else key_to_node.get(amount.recovery_key)
             db.add(
                 ChainCombinationAmount(
                     combination=combo,
                     category_node_id=category.id,
                     input_amount=amount.input_amount,
+                    efficiency=1.0 if energy else (amount.efficiency if amount.efficiency > 0 else 1.0),
                     recovery_node_id=recovery.id if recovery else None,
                 )
             )
@@ -180,8 +196,11 @@ def _assign_category_units(db, key_to_node: dict[str, ChainNode], payload: Chain
         if edge.kind != "energy":
             continue
         source = key_to_node.get(edge.source_key)
+        target = key_to_node.get(edge.target_key)
         if source is not None and source.type == "category":
             energy_keys.add(edge.source_key)
+        if target is not None and target.type == "category":
+            energy_keys.add(edge.target_key)
 
     ids = {dataset_id for values in ordered.values() for dataset_id in values}
     by_id = {row.id: row for row in db.query(Dataset).filter(Dataset.id.in_(ids)).all()} if ids else {}

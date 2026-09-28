@@ -386,7 +386,8 @@ def test_waste_is_amount_minus_one(db):
         if combo.process_node_id == make.id
         for row in combo.amounts
     )
-    amount.input_amount = 1.2
+    amount.input_amount = 1.0
+    amount.efficiency = 1 / 1.2
     amount.recovery_node_id = recovery.id
     db.flush()
     result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
@@ -406,7 +407,8 @@ def test_upstream_product_edge_waste(db):
     db.flush()
     form = next(node for node in chain.nodes if node.name == "Folieren")
     link = next(edge for edge in chain.edges if edge.target_id == form.id and edge.kind == "material")
-    link.input_amount = 1.1
+    link.input_amount = 1.0
+    link.efficiency = 1 / 1.1
     db.add(ChainEdge(chain=chain, source_id=form.id, target_id=recovery.id, kind="waste"))
     db.flush()
     result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
@@ -446,6 +448,202 @@ def test_lcia_applied_as_final_step(db, monkeypatch):
     assert result.blockers == []
     assert result.mode == MODE_LCIA
     assert result.totals[CLIMATE_CHANGE] == pytest.approx(2.0)
+
+
+def test_additive_efficiency_creates_waste_below_one(db):
+    chain, datasets, roles, *_rest = _chain(db)
+    recovery_ds = Dataset(name="Verbrennung", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    _factor(recovery_ds, CLIMATE_CHANGE, 10.0)
+    db.add(recovery_ds)
+    db.flush()
+    datasets[recovery_ds.id] = recovery_ds
+    recovery = ChainNode(chain=chain, type="recovery", name="Verwertung", dataset_id=recovery_ds.id, unit="kg")
+    db.add(recovery)
+    db.flush()
+    make = next(node for node in chain.nodes if node.name == "Granulieren")
+    amount = next(
+        row for combo in chain.combinations if combo.process_node_id == make.id for row in combo.amounts
+    )
+    amount.input_amount = 0.05
+    amount.efficiency = 0.85
+    amount.recovery_node_id = recovery.id
+    db.flush()
+    result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
+    einsatz = 0.05 / 0.85
+    waste = 0.05 * (1 / 0.85 - 1)
+    assert result.blockers == []
+    assert result.totals[CLIMATE_CHANGE] == pytest.approx(einsatz + waste * 10 + 0.2)
+
+
+def test_energy_efficiency_is_ignored(db):
+    chain, datasets, roles, *_rest = _chain(db)
+    form = next(node for node in chain.nodes if node.name == "Folieren")
+    amount = next(row for combo in chain.combinations if combo.process_node_id == form.id for row in combo.amounts)
+    amount.input_amount = 0.5
+    amount.efficiency = 0.95
+    result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
+    assert result.blockers == []
+    assert result.totals[CLIMATE_CHANGE] == pytest.approx(0.8 + 0.5 * 0.4)
+    assert all("Verwertung" not in row.role_label for row in result.contributions)
+
+
+def test_material_wastes_share_one_recovery(db):
+    chain, datasets, roles, *_rest = _chain(db)
+    recovery_ds = Dataset(name="Verbrennung", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    _factor(recovery_ds, CLIMATE_CHANGE, 10.0)
+    db.add(recovery_ds)
+    db.flush()
+    datasets[recovery_ds.id] = recovery_ds
+    recovery = ChainNode(chain=chain, type="recovery", name="Verwertung", dataset_id=recovery_ds.id, unit="kg")
+    other = ChainNode(chain=chain, type="category", name="Additiv", unit="kg")
+    db.add_all([recovery, other])
+    db.flush()
+    make = next(node for node in chain.nodes if node.name == "Granulieren")
+    db.add(ChainEdge(chain=chain, source_id=other.id, target_id=make.id, kind="material"))
+    db.add(ChainEdge(chain=chain, source_id=make.id, target_id=recovery.id, kind="waste"))
+    starch_amount = next(
+        row for combo in chain.combinations if combo.process_node_id == make.id for row in combo.amounts
+    )
+    starch_amount.input_amount = 0.6
+    starch_amount.efficiency = 0.9
+    starch_amount.recovery_node_id = recovery.id
+    db.add(
+        ChainCombinationAmount(
+            combination=starch_amount.combination,
+            category_node_id=other.id,
+            input_amount=0.4,
+            efficiency=0.8,
+            recovery_node_id=recovery.id,
+        )
+    )
+    other_ds = Dataset(name="Additiv", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    _factor(other_ds, CLIMATE_CHANGE, 1.0)
+    db.add(other_ds)
+    db.flush()
+    datasets[other_ds.id] = other_ds
+    _share(db, chain, other, other_ds, 1.0)
+    db.flush()
+    result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
+    starch_waste = 0.6 * (1 / 0.9 - 1)
+    other_waste = 0.4 * (1 / 0.8 - 1)
+    assert result.blockers == []
+    recovery_rows = [row for row in result.contributions if row.node_name == "Verwertung"]
+    assert len(recovery_rows) == 1
+    assert recovery_rows[0].amount == pytest.approx(starch_waste + other_waste)
+    assert result.totals[CLIMATE_CHANGE] == pytest.approx(
+        0.6 / 0.9 + 0.4 / 0.8 + (starch_waste + other_waste) * 10 + 0.2
+    )
+
+
+def test_two_recoveries_on_one_process_block(db):
+    chain, datasets, roles, *_rest = _chain(db)
+    first = ChainNode(chain=chain, type="recovery", name="Verwertung A", unit="kg")
+    second = ChainNode(chain=chain, type="recovery", name="Verwertung B", unit="kg")
+    other = ChainNode(chain=chain, type="category", name="Additiv", unit="kg")
+    db.add_all([first, second, other])
+    db.flush()
+    make = next(node for node in chain.nodes if node.name == "Granulieren")
+    db.add(ChainEdge(chain=chain, source_id=other.id, target_id=make.id, kind="material"))
+    starch_amount = next(
+        row for combo in chain.combinations if combo.process_node_id == make.id for row in combo.amounts
+    )
+    starch_amount.efficiency = 0.9
+    starch_amount.recovery_node_id = first.id
+    db.add(
+        ChainCombinationAmount(
+            combination=starch_amount.combination,
+            category_node_id=other.id,
+            input_amount=0.4,
+            efficiency=0.8,
+            recovery_node_id=second.id,
+        )
+    )
+    db.flush()
+    result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
+    assert any("nur eine Verwertung" in message for message in result.blockers)
+
+
+def test_category_through_transport_keeps_mass_and_impact(db):
+    chain, datasets, roles, starch, *_rest = _chain(db)
+    truck = Dataset(name="Lkw", location="DE", unit="kg·km", source_kind=SOURCE_ECOINVENT)
+    _factor(truck, CLIMATE_CHANGE, 0.01)
+    db.add(truck)
+    db.flush()
+    datasets[truck.id] = truck
+    starch_node = next(node for node in chain.nodes if node.name == "Stärke")
+    make = next(node for node in chain.nodes if node.name == "Granulieren")
+    direct = next(edge for edge in chain.edges if edge.source_id == starch_node.id and edge.target_id == make.id)
+    chain.edges.remove(direct)
+    db.delete(direct)
+    haul = ChainNode(
+        chain=chain, type="transport", name="Transport", dataset_id=truck.id, unit="kg·km", distance_km=10
+    )
+    db.add(haul)
+    db.flush()
+    db.add_all(
+        [
+            ChainEdge(chain=chain, source_id=starch_node.id, target_id=haul.id, kind="material"),
+            ChainEdge(chain=chain, source_id=haul.id, target_id=make.id, kind="material"),
+        ]
+    )
+    db.flush()
+    result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
+    assert result.blockers == []
+    assert result.totals[CLIMATE_CHANGE] == pytest.approx(0.8 + 0.8 * 10 * 0.01 + 0.2)
+
+
+def test_byproduct_share_includes_recovery_and_credit(db):
+    end = EndProduct(name="Teil", unit="kg")
+    starch = Role(slug="staerke", label="Stärke")
+    energy = Role(slug="energie", label="Energie")
+    db.add_all([end, starch, energy])
+    db.flush()
+    starch_ds = Dataset(name="Stärke", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    elec = Dataset(name="Strom", location="DE", unit="kWh", source_kind=SOURCE_ECOINVENT)
+    recovery_ds = Dataset(name="Verbrennung", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    _factor(starch_ds, CLIMATE_CHANGE, 1.0)
+    _factor(elec, CLIMATE_CHANGE, 0.4)
+    _factor(recovery_ds, CLIMATE_CHANGE, 10.0)
+    db.add_all([starch_ds, elec, recovery_ds])
+    db.flush()
+    chain = Chain(name="Anteil", status="published", end_product_id=end.id, end_unit="kg")
+    db.add(chain)
+    db.flush()
+    part = ChainNode(chain=chain, type="product", name="Teil", unit="kg", is_functional=True)
+    side = ChainNode(chain=chain, type="product", name="Nebenprodukt", unit="kg")
+    process = ChainNode(chain=chain, type="process", name="Granulieren", unit="kg")
+    starch_node = ChainNode(chain=chain, type="category", name="Stärke", role_id=starch.id, unit="kg")
+    credit = ChainNode(chain=chain, type="category", name="Stromabgabe", role_id=energy.id, unit="kWh")
+    recovery = ChainNode(chain=chain, type="recovery", name="Verwertung", dataset_id=recovery_ds.id, unit="kg")
+    db.add_all([part, side, process, starch_node, credit, recovery])
+    db.flush()
+    db.add_all(
+        [
+            ChainEdge(chain=chain, source_id=starch_node.id, target_id=process.id, kind="material"),
+            ChainEdge(chain=chain, source_id=process.id, target_id=part.id, kind="material"),
+            ChainEdge(chain=chain, source_id=process.id, target_id=side.id, kind="material", input_amount=0.25),
+            ChainEdge(chain=chain, source_id=process.id, target_id=credit.id, kind="energy"),
+        ]
+    )
+    combo = _combo(
+        db,
+        chain,
+        process,
+        [],
+        [(starch_node, 1.0, recovery), (credit, 0.5, None)],
+    )
+    next(row for row in combo.amounts if row.category_node_id == starch_node.id).efficiency = 0.8
+    _share(db, chain, starch_node, starch_ds, 1.0)
+    _share(db, chain, credit, elec, 1.0)
+    db.flush()
+    datasets = {starch_ds.id: starch_ds, elec.id: elec, recovery_ds.id: recovery_ds}
+    roles = {starch.id: starch, energy.id: energy}
+    result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
+    einsatz = 1 / 0.8
+    waste = 1 * (1 / 0.8 - 1)
+    share = 1 / 1.25
+    assert result.blockers == []
+    assert result.totals[CLIMATE_CHANGE] == pytest.approx((einsatz + waste * 10 - 0.5 * 0.4) * share)
 
 
 def test_export_inventory_lists_all_flows(db, monkeypatch):

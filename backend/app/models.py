@@ -198,6 +198,7 @@ class ChainEdge(Base):
     kind: Mapped[str] = mapped_column(String(32), default="material")
     input_amount: Mapped[float] = mapped_column(Float, default=1.0)
     efficiency: Mapped[float] = mapped_column(Float, default=1.0)
+    allocation_share: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     chain: Mapped[Chain] = relationship(back_populates="edges")
     source: Mapped[ChainNode] = relationship(foreign_keys=[source_id])
@@ -247,6 +248,7 @@ class ChainCombinationAmount(Base):
     )
     category_node_id: Mapped[int] = mapped_column(ForeignKey("chain_nodes.id", ondelete="CASCADE"))
     input_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    efficiency: Mapped[float] = mapped_column(Float, default=1.0)
     recovery_node_id: Mapped[int | None] = mapped_column(
         ForeignKey("chain_nodes.id", ondelete="SET NULL"), nullable=True
     )
