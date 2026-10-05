@@ -388,16 +388,52 @@ def share_key(category_id: int, dataset_id: int) -> str:
     return f"{category_id}:{dataset_id}"
 
 
-def _normalize_share_map(pairs: list[tuple[int, float]]) -> tuple[dict[int, float], str | None]:
-    if not pairs:
-        return {}, "leer"
-    if len(pairs) == 1:
-        return {pairs[0][0]: 1.0}, None
-    share_sum = sum(share for _dataset_id, share in pairs)
-    if abs(share_sum - 1.0) > 1e-6 and abs(share_sum - 100.0) > 1e-6:
-        return {}, "100 %"
-    factor = 100.0 if share_sum > 2 else 1.0
-    return {dataset_id: share / factor for dataset_id, share in pairs}, None
+def _ordered_datasets(rows: list[Dataset]) -> list[Dataset]:
+    catalog = sorted(
+        (row for row in rows if row.source_kind != SOURCE_USER),
+        key=lambda row: (row.name, row.id),
+    )
+    own = sorted(
+        (row for row in rows if row.source_kind == SOURCE_USER),
+        key=lambda row: (row.name, row.id),
+    )
+    return [*catalog, *own]
+
+
+def category_dataset_options(
+    category: ChainNode,
+    datasets: dict[int, Dataset],
+    process_combos: list,
+) -> list[Dataset]:
+    if category.datasets_differ:
+        ids = {
+            axis.dataset_id
+            for combo in process_combos
+            for axis in combo.axes
+            if axis.category_node_id == category.id and axis.dataset_id is not None
+        }
+        return _ordered_datasets([datasets[item] for item in ids if item in datasets])
+    if category.role_id is None:
+        return []
+    matched = [
+        dataset
+        for dataset in datasets.values()
+        if any(link.role_id == category.role_id for link in dataset.roles)
+    ]
+    return _ordered_datasets(matched)
+
+
+def chosen_dataset_id(
+    category_id: int,
+    options: list[Dataset],
+    selections: dict[str, int],
+) -> int | None:
+    if not options:
+        return None
+    selected = selections.get(str(category_id))
+    if selected is not None and any(option.id == selected for option in options):
+        return selected
+    return options[0].id
 
 
 def calculate(
@@ -417,9 +453,6 @@ def calculate(
     nodes = list(chain.nodes)
     edges = list(chain.edges)
     combinations = list(chain.combinations)
-    defaults = {
-        (row.category_node_id, row.dataset_id): row.default_share for row in chain.dataset_shares
-    }
     if not nodes:
         blockers.append("Die Kette hat keine Knoten.")
         return _empty_result(blockers)
@@ -559,12 +592,6 @@ def calculate(
             return None
         return next(iter(ids))
 
-    def share_of(category_id: int, dataset_id: int) -> float:
-        key = share_key(category_id, dataset_id)
-        if key in payload.shares:
-            return payload.shares[key]
-        return defaults.get((category_id, dataset_id), 0.0)
-
     combos_by_process: dict[int, list] = defaultdict(list)
     for combo in combinations:
         combos_by_process[combo.process_node_id].append(combo)
@@ -593,45 +620,18 @@ def calculate(
         if not process_combos and active_categories:
             blockers.append(f"Kombination fehlt für {process.name}.")
             continue
-        share_maps: dict[int, dict[int, float]] = {}
-        share_failed = False
+        chosen: dict[int, int] = {}
+        choose_failed = False
         for category in active_categories:
-            if category.datasets_differ:
-                dataset_ids = sorted(
-                    {
-                        axis.dataset_id
-                        for combo in process_combos
-                        for axis in combo.axes
-                        if axis.category_node_id == category.id and axis.dataset_id is not None
-                    }
-                )
-            else:
-                dataset_ids = sorted(
-                    {
-                        dataset_id
-                        for (category_id, dataset_id) in defaults
-                        if category_id == category.id
-                    }
-                    | {
-                        int(key.split(":", 1)[1])
-                        for key in payload.shares
-                        if key.startswith(f"{category.id}:") and key.split(":", 1)[1].isdigit()
-                    }
-                )
-            if not dataset_ids:
+            options = category_dataset_options(category, datasets, process_combos)
+            picked = chosen_dataset_id(category.id, options, payload.selections)
+            if picked is None:
                 if not category.optional:
                     blockers.append(f"Datensatz fehlt für {category.name}.")
-                    share_failed = True
+                    choose_failed = True
                 continue
-            scaled, share_error = _normalize_share_map(
-                [(dataset_id, share_of(category.id, dataset_id)) for dataset_id in dataset_ids]
-            )
-            if share_error:
-                blockers.append(f"Anteile für {category.name} müssen 100 % ergeben.")
-                share_failed = True
-                continue
-            share_maps[category.id] = scaled
-        if share_failed:
+            chosen[category.id] = picked
+        if choose_failed:
             continue
         for combo in process_combos:
             axis = {
@@ -639,14 +639,15 @@ def calculate(
                 for item in combo.axes
                 if item.dataset_id is not None
             }
-            weight = 1.0
-            for category_id, dataset_id in axis.items():
-                weight *= share_maps.get(category_id, {}).get(dataset_id, 0.0)
-            if weight <= 1e-12:
+            if any(
+                category.datasets_differ and axis.get(category.id) != chosen.get(category.id)
+                for category in active_categories
+                if category.id in chosen
+            ):
                 continue
             for amount in combo.amounts:
                 category = by_id.get(amount.category_node_id)
-                if category is None or category.id not in share_maps:
+                if category is None or category.id not in chosen:
                     continue
                 kind = category_kind.get((process.id, category.id), "material")
                 efficiency = amount.efficiency or 0.0
@@ -660,27 +661,23 @@ def calculate(
                 share = process_share.get(process.id, 1.0)
                 sign = -1.0 if kind == "credit" else 1.0
                 unit = category.unit
-                if category.datasets_differ:
-                    portions = [(axis.get(category.id), 1.0)]
-                else:
-                    portions = list(share_maps[category.id].items())
-                for dataset_id, portion in portions:
-                    qty = sign * demand * einsatz * weight * portion * share
-                    add_use(
-                        category,
-                        dataset_id,
-                        qty,
-                        unit,
-                        f"combo:{combo.id}:{category.id}:{dataset_id}",
-                        role_id=category.role_id or 0,
-                    )
-                    if kind == "material":
-                        hop = _transport_into(by_id, edges, category.id, process.id)
-                        if hop and hop.id not in skipped and not (hop.optional and hop.id not in optional_on):
-                            transport_mass[hop.id] += abs(qty)
+                dataset_id = chosen[category.id]
+                qty = sign * demand * einsatz * share
+                add_use(
+                    category,
+                    dataset_id,
+                    qty,
+                    unit,
+                    f"combo:{combo.id}:{category.id}:{dataset_id}",
+                    role_id=category.role_id or 0,
+                )
+                if kind == "material":
+                    hop = _transport_into(by_id, edges, category.id, process.id)
+                    if hop and hop.id not in skipped and not (hop.optional and hop.id not in optional_on):
+                        transport_mass[hop.id] += abs(qty)
                 if kind != "material":
                     continue
-                waste_qty = demand * material_waste(soll, efficiency) * weight * share
+                waste_qty = demand * material_waste(soll, efficiency) * share
                 if waste_qty <= 1e-12:
                     continue
                 recovery_id = recovery_for(process.id, process.name)

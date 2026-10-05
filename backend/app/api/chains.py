@@ -20,7 +20,7 @@ from app.models import (
 )
 from app.schemas import ChainCreateIn, ChainOut, ChainUpdateIn
 from app.serialize import chain_out
-from app.services.publish import invalidate_configurations, probe_and_publish, validate_structure
+from app.services.publish import invalidate_configurations, mass_balance_messages, probe_and_publish, validate_structure
 from app.services.units import resolve_category_unit
 
 router = APIRouter()
@@ -265,6 +265,12 @@ def update_chain(chain_id: int, payload: ChainUpdateIn, _admin: AdminUser, db: D
         invalidate_configurations(db, chain.id, "Die Kette wurde zurückgezogen.")
     if payload.nodes is not None:
         _apply_graph(db, chain, payload)
+        db.expire(chain)
+        chain = _load_chain(db, chain.id)
+        mass_errors = mass_balance_messages(chain)
+        if mass_errors:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=mass_errors)
         if chain.status == CHAIN_PUBLISHED:
             chain.status = CHAIN_DRAFT
             invalidate_configurations(db, chain.id, "Die Kettenstruktur hat sich geändert.")

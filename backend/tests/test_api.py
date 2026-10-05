@@ -386,6 +386,96 @@ def test_chain_graph_roundtrip():
     assert result.json()["totals"]["climate_change"] == 1.2 * 1.5 + (1.2 - 1) * 2
 
 
+def test_save_rejects_open_mass():
+    client, db = _client()
+    _login(client)
+    starch_role = client.post("/api/roles", json={"label": "Stärke"}).json()
+    additive_role = client.post("/api/roles", json={"label": "Additiv"}).json()
+    end = client.post("/api/end-products", json={"name": "Teil", "unit": "kg"}).json()
+    created = client.post("/api/chains", json={"name": "Spritzgussteil", "end_product_id": end["id"]})
+    chain = created.json()
+    functional = chain["nodes"][0]
+    starch_ds = Dataset(name="Maisstärke", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    additive_ds = Dataset(name="Additiv", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    starch_ds.roles.append(DatasetRole(role_id=starch_role["id"]))
+    additive_ds.roles.append(DatasetRole(role_id=additive_role["id"]))
+    db.add_all([starch_ds, additive_ds])
+    db.commit()
+    db.refresh(starch_ds)
+    db.refresh(additive_ds)
+
+    def graph(starch_amount: float) -> dict:
+        return {
+            "nodes": [
+                {
+                    "id": functional["id"],
+                    "client_key": f"n-{functional['id']}",
+                    "type": "product",
+                    "name": "Teil",
+                    "position_x": 400,
+                    "position_y": 80,
+                    "unit": "kg",
+                    "is_functional": True,
+                },
+                {
+                    "client_key": "process",
+                    "type": "process",
+                    "name": "Granulieren",
+                    "position_x": 220,
+                    "position_y": 80,
+                    "unit": "kg",
+                },
+                {
+                    "client_key": "starch",
+                    "type": "category",
+                    "name": "Stärke",
+                    "position_x": 40,
+                    "position_y": 40,
+                    "role_id": starch_role["id"],
+                    "unit": "kg",
+                    "datasets_differ": True,
+                },
+                {
+                    "client_key": "additive",
+                    "type": "category",
+                    "name": "Additiv",
+                    "position_x": 40,
+                    "position_y": 160,
+                    "role_id": additive_role["id"],
+                    "unit": "kg",
+                },
+            ],
+            "edges": [
+                {"source_key": "starch", "target_key": "process", "kind": "material"},
+                {"source_key": "additive", "target_key": "process", "kind": "material"},
+                {"source_key": "process", "target_key": f"n-{functional['id']}", "kind": "material"},
+            ],
+            "combinations": [
+                {
+                    "process_key": "process",
+                    "axes": [{"category_key": "starch", "dataset_id": starch_ds.id}],
+                    "amounts": [
+                        {"category_key": "starch", "input_amount": starch_amount, "efficiency": 0.9},
+                        {"category_key": "additive", "input_amount": 0.05, "efficiency": 0.85},
+                    ],
+                }
+            ],
+            "dataset_shares": [
+                {"category_key": "starch", "dataset_id": starch_ds.id, "default_share": 1},
+                {"category_key": "additive", "dataset_id": additive_ds.id, "default_share": 1},
+            ],
+        }
+
+    rejected = client.patch(f"/api/chains/{chain['id']}", json=graph(0.8))
+    assert rejected.status_code == 400, rejected.text
+    assert "ist 0,85 kg je 1 kg, erwartet 1 kg." in rejected.text
+    stored = client.get(f"/api/chains/{chain['id']}")
+    assert stored.status_code == 200
+    assert stored.json()["combinations"] == []
+    saved = client.patch(f"/api/chains/{chain['id']}", json=graph(0.95))
+    assert saved.status_code == 200, saved.text
+
+
 def test_import_rejects_dataset_without_inventory(tmp_path, monkeypatch):
     from app.config import settings
 

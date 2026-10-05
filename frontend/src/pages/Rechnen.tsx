@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { DataApi, MetaApi, defaultPayload, download } from "../api";
+import { DataApi, MetaApi, datasetsForCategory, defaultPayload, download, payloadFromConfiguration } from "../api";
 import { ChainGraph, type GraphEdge, type GraphNode } from "../components/ChainGraph";
 import type { CalcResult, CalculatePayload, Chain, Dataset, EndProduct, Indicator, Role } from "../types";
 
@@ -58,6 +58,8 @@ export function RechnenPage() {
   const [result, setResult] = useState<CalcResult | null>(null);
   const [saveName, setSaveName] = useState("Konfiguration");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
 
   const productChains = useMemo(
     () => chains.filter((item) => item.status === "published" && (productId === "" || item.end_product_id === productId)),
@@ -73,34 +75,54 @@ export function RechnenPage() {
       DataApi.datasets(),
       DataApi.userDatasets(),
       MetaApi.indicators(),
-    ]).then(([p, c, r, d, u, i]) => {
+    ]).then(async ([p, c, r, d, u, i]) => {
       setProducts(p);
       setChains(c);
       setRoles(r);
       setCatalog(d);
       setOwn(u);
       setIndicators(i);
+      const configId = Number(params.get("config") || 0);
+      if (configId) {
+        try {
+          const config = await DataApi.configuration(configId);
+          const match = c.find((item) => item.id === config.chain_id);
+          if (!match) {
+            setError("Die Kette dieser Konfiguration ist nicht verfügbar.");
+          } else {
+            setProductId(match.end_product_id);
+            setChain(match);
+            setSaveName(config.name);
+            const loaded = payloadFromConfiguration(match, config, d, u);
+            setPayload(loaded.payload);
+            if (loaded.missing.length) {
+              setNotice(`Für ${loaded.missing.join(", ")} gilt wieder der erste Datensatz.`);
+            }
+            return;
+          }
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "Konfiguration konnte nicht geladen werden.");
+        }
+      }
       const fromQuery = Number(params.get("chain") || 0);
       const first = c.find((item) => item.id === fromQuery && item.status === "published") || c.find((item) => item.status === "published");
       if (first) {
         setProductId(first.end_product_id);
         setChain(first);
-        setPayload(defaultPayload(first));
+        setPayload(defaultPayload(first, d, u));
       } else if (p[0]) {
         setProductId(p[0].id);
       }
     });
   }, []);
 
-  function optionsFor(roleId: number | null) {
-    return [...catalog, ...own].filter((item) => roleId == null || item.role_ids.includes(roleId));
-  }
-
   function pickChain(id: number) {
     const next = chains.find((item) => item.id === id) || null;
     setChain(next);
-    setPayload(next ? defaultPayload(next) : null);
+    setPayload(next ? defaultPayload(next, catalog, own) : null);
     setResult(null);
+    setNotice("");
+    setSelectedCategory(null);
     setParams(id ? { chain: String(id) } : {});
   }
 
@@ -121,13 +143,31 @@ export function RechnenPage() {
   }
 
   const skipped = useMemo(() => (chain && payload ? skippedNodes(chain, payload.replaced_nodes) : new Set<number>()), [chain, payload]);
-  const graph = chain ? asGraph(chain) : null;
+  const graph = useMemo(() => {
+    if (!chain) return null;
+    const base = asGraph(chain);
+    if (!payload) return base;
+    return {
+      ...base,
+      nodes: base.nodes.map((node) => {
+        if (node.type !== "category") return node;
+        const category = chain.nodes.find((item) => String(item.id) === node.key);
+        if (!category) return node;
+        const options = datasetsForCategory(chain, category, catalog, own);
+        const chosen = options.find((item) => item.id === (payload.selections[node.key] ?? options[0]?.id));
+        return {
+          ...node,
+          datasetLabel: chosen ? `${chosen.name}${chosen.location ? `, ${chosen.location}` : ""}` : "",
+        };
+      }),
+    };
+  }, [chain, payload, catalog, own]);
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold text-forest-800">Rechnen</h1>
-        <p className="text-sm text-slate-600">Endprodukt, Kette und Menge wählen. Anteile je Kategorie bestimmen die gewichtete Rezeptur.</p>
+        <p className="text-sm text-slate-600">Endprodukt, Kette und Menge wählen. Je Kategorie gilt ein Datensatz.</p>
       </div>
       <div className="card grid gap-4 md:grid-cols-3">
         <div>
@@ -177,10 +217,60 @@ export function RechnenPage() {
         </div>
       </div>
 
-      {graph && (
+      {graph && chain && payload && (
         <div className="space-y-2">
           <h2 className="font-semibold">Kette</h2>
-          <ChainGraph nodes={graph.nodes} edges={graph.edges} readOnly />
+          <p className="text-sm text-slate-600">Kategorie anklicken, dann den Datensatz wählen.</p>
+          <div className="relative">
+            <ChainGraph
+              nodes={graph.nodes}
+              edges={graph.edges}
+              readOnly
+              selectedKey={selectedCategory}
+              onSelect={(key) => {
+                if (!key) {
+                  setSelectedCategory(null);
+                  return;
+                }
+                const node = chain.nodes.find((item) => String(item.id) === key);
+                setSelectedCategory(node?.type === "category" ? key : null);
+              }}
+            />
+            {selectedCategory &&
+              (() => {
+                const category = chain.nodes.find((item) => String(item.id) === selectedCategory && item.type === "category");
+                if (!category) return null;
+                const options = datasetsForCategory(chain, category, catalog, own);
+                const selectedId = payload.selections[selectedCategory] ?? options[0]?.id;
+                return (
+                  <aside className="card absolute right-3 top-3 z-10 w-72 space-y-2 shadow-lg">
+                    <h3 className="font-semibold">{roleById[category.role_id || 0]?.label || category.name}</h3>
+                    <p className="text-xs text-slate-600">Datensatz für die Rechnung</p>
+                    <div className="max-h-64 space-y-1 overflow-y-auto">
+                      {options.length === 0 && <p className="text-sm text-slate-600">Kein Datensatz.</p>}
+                      {options.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          className={`block w-full rounded-lg border px-3 py-2 text-left text-sm ${
+                            item.id === selectedId ? "border-forest-700 bg-emerald-50" : "border-slate-200 bg-white"
+                          }`}
+                          onClick={() =>
+                            setPayload({
+                              ...payload,
+                              selections: { ...payload.selections, [selectedCategory]: item.id },
+                            })
+                          }
+                        >
+                          {item.name}
+                          {item.location ? `, ${item.location}` : ""}
+                        </button>
+                      ))}
+                    </div>
+                  </aside>
+                );
+              })()}
+          </div>
         </div>
       )}
 
@@ -275,11 +365,14 @@ export function RechnenPage() {
                 {categories.map((category) => {
                   const optional = category.optional && !category.datasets_differ;
                   const on = !optional || payload.optional_on.includes(category.id);
-                  const datasetIds = category.datasets_differ
-                    ? [...new Set(combos.flatMap((combo) => combo.axes.filter((axis) => axis.category_node_id === category.id).map((axis) => axis.dataset_id)).filter((id): id is number => id != null))]
-                    : optionsFor(category.role_id).map((item) => item.id);
+                  const options = datasetsForCategory(chain, category, catalog, own);
+                  const selectedId = payload.selections[String(category.id)] ?? options[0]?.id ?? "";
                   return (
-                    <div key={category.id} className="space-y-2">
+                    <div
+                      key={category.id}
+                      id={`category-${category.id}`}
+                      className={`space-y-2 rounded-lg ${selectedCategory === String(category.id) ? "ring-2 ring-amber-400" : ""}`}
+                    >
                       <div className="flex items-center justify-between">
                         <h3 className="text-sm font-medium">
                           {roleById[category.role_id || 0]?.label || category.name}
@@ -302,32 +395,28 @@ export function RechnenPage() {
                           </label>
                         )}
                       </div>
-                      {datasetIds.map((datasetId) => {
-                        const shareKey = `${category.id}:${datasetId}`;
-                        const fallback = chain.dataset_shares.find(
-                          (share) => share.category_node_id === category.id && share.dataset_id === datasetId,
-                        )?.default_share;
-                        return (
-                          <div key={shareKey} className="grid gap-2 md:grid-cols-[1fr_140px] md:items-center">
-                            <p className="text-sm">{named(datasetId)}</p>
-                            {datasetIds.length > 1 && (
-                              <input
-                                className="input"
-                                type="number"
-                                step="any"
-                                disabled={!on}
-                                value={payload.shares[shareKey] ?? fallback ?? 0}
-                                onChange={(e) =>
-                                  setPayload({
-                                    ...payload,
-                                    shares: { ...payload.shares, [shareKey]: Number(e.target.value) },
-                                  })
-                                }
-                              />
-                            )}
-                          </div>
-                        );
-                      })}
+                      <label className="block text-sm">
+                        Datensatz
+                        <select
+                          className="input mt-1"
+                          value={selectedId}
+                          disabled={!on || options.length === 0}
+                          onChange={(e) => {
+                            const datasetId = Number(e.target.value);
+                            setPayload({
+                              ...payload,
+                              selections: { ...payload.selections, [String(category.id)]: datasetId },
+                            });
+                          }}
+                        >
+                          {options.length === 0 && <option value="">Kein Datensatz</option>}
+                          {options.map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {named(item.id)}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
                     </div>
                   );
                 })}
@@ -426,6 +515,7 @@ export function RechnenPage() {
           </>
         )}
       </div>
+      {notice && <p className="text-sm text-amber-800">{notice}</p>}
       {error && <p className="text-sm text-red-700">{error}</p>}
       {result && result.blockers.length > 0 && (
         <ul className="card text-sm text-red-700">

@@ -18,7 +18,7 @@ from app.models import (
     EndProduct,
     Role,
 )
-from app.services.calculate import MODE_INVENTORY, MODE_LCIA, CalcInput, calculate, share_key
+from app.services.calculate import MODE_INVENTORY, MODE_LCIA, CalcInput, calculate
 
 
 def _factor(dataset: Dataset, indicator: str, value: float) -> None:
@@ -127,29 +127,27 @@ def test_two_stages_with_upstream(db):
     assert result.totals[CLIMATE_CHANGE] == pytest.approx(0.8 + 0.2)
 
 
-def test_shares_must_sum_to_one(db):
-    chain, datasets, roles, starch, starch2, *_rest = _chain(db, two_starch=True)
+def test_missing_selection_uses_first_dataset(db):
+    chain, datasets, roles, _starch, starch2, *_rest = _chain(db, two_starch=True)
+    result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
+    assert result.blockers == []
+    assert result.totals[CLIMATE_CHANGE] == pytest.approx(0.8 * 2 + 0.2)
+    assert any(row.dataset_id == starch2.id for row in result.contributions)
+
+
+def test_selection_uses_named_dataset(db):
+    chain, datasets, roles, starch, _starch2, *_rest = _chain(db, two_starch=True)
     starch_node = next(node for node in chain.nodes if node.name == "Stärke")
     result = calculate(
         chain,
-        CalcInput(
-            end_amount=1.0,
-            shares={
-                share_key(starch_node.id, starch.id): 0.5,
-                share_key(starch_node.id, starch2.id): 0.2,
-            },
-        ),
+        CalcInput(end_amount=1.0, selections={str(starch_node.id): starch.id}),
         datasets,
         roles,
     )
-    assert any("100" in msg for msg in result.blockers)
-
-
-def test_shares_split_amount(db):
-    chain, datasets, roles, *_rest = _chain(db, two_starch=True)
-    result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
     assert result.blockers == []
-    assert result.totals[CLIMATE_CHANGE] == pytest.approx(1.12 + 0.2)
+    assert result.totals[CLIMATE_CHANGE] == pytest.approx(0.8 + 0.2)
+    assert any(row.dataset_id == starch.id for row in result.contributions)
+    assert all(row.dataset_id != _starch2.id or row.node_name != "Stärke" for row in result.contributions)
 
 
 def test_optional_energy_off_by_default(db):
@@ -270,12 +268,22 @@ def test_combination_weight_is_product_of_shares(db):
     _share(db, chain, add_node, add_b, 0.5)
     db.flush()
     datasets = {item.id: item for item in (bio, fossil, add_a, add_b)}
-    result = calculate(chain, CalcInput(end_amount=1.0), datasets, {starch.id: starch, additive.id: additive})
+    role_map = {starch.id: starch, additive.id: additive}
+    result = calculate(chain, CalcInput(end_amount=1.0), datasets, role_map)
     assert result.blockers == []
-    starch_total = 0.6 * 0.5 * 1.0 * 1 + 0.6 * 0.5 * 1.0 * 1 + 0.4 * 0.5 * 0.9 * 2 + 0.4 * 0.5 * 0.9 * 2
-    additive_total = 0.6 * 0.5 * 1 * 3 + 0.6 * 0.5 * 1 * 4 + 0.4 * 0.5 * 1 * 3 + 0.4 * 0.5 * 1 * 4
-    assert result.totals[CLIMATE_CHANGE] == pytest.approx(starch_total + additive_total)
+    assert result.totals[CLIMATE_CHANGE] == pytest.approx(1.0 + 3.0)
     assert len(chain.combinations) == 4
+    chosen = calculate(
+        chain,
+        CalcInput(
+            end_amount=1.0,
+            selections={str(starch_node.id): fossil.id, str(add_node.id): add_b.id},
+        ),
+        datasets,
+        role_map,
+    )
+    assert chosen.blockers == []
+    assert chosen.totals[CLIMATE_CHANGE] == pytest.approx(0.9 * 2 + 4.0)
 
 
 def test_uniform_energy_does_not_multiply_rows(db):
@@ -304,9 +312,7 @@ def test_uniform_energy_does_not_multiply_rows(db):
     assert len(chain.combinations) == 2
     result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
     assert result.blockers == []
-    starch_total = 0.6 * 0.8 * 1 + 0.4 * 0.8 * 2
-    energy_total = (0.6 * 2.0 + 0.4 * 3.5) * (0.5 * 0.4 + 0.5 * 0.8)
-    assert result.totals[CLIMATE_CHANGE] == pytest.approx(starch_total + energy_total)
+    assert result.totals[CLIMATE_CHANGE] == pytest.approx(0.8 * 2 + 3.5 * 0.4)
 
 
 def test_category_unit_must_match_dataset(db):
@@ -340,13 +346,7 @@ def test_user_dataset_unit_must_match_category(db):
     datasets[own.id] = own
     result = calculate(
         chain,
-        CalcInput(
-            end_amount=1.0,
-            shares={
-                share_key(energy_node.id, elec.id): 0.5,
-                share_key(energy_node.id, own.id): 0.5,
-            },
-        ),
+        CalcInput(end_amount=1.0, selections={str(energy_node.id): own.id}),
         datasets,
         roles,
     )
@@ -494,8 +494,11 @@ def test_material_wastes_share_one_recovery(db):
     db.add(recovery_ds)
     db.flush()
     datasets[recovery_ds.id] = recovery_ds
+    additive = Role(slug="additiv", label="Additiv")
+    db.add(additive)
+    db.flush()
     recovery = ChainNode(chain=chain, type="recovery", name="Verwertung", dataset_id=recovery_ds.id, unit="kg")
-    other = ChainNode(chain=chain, type="category", name="Additiv", unit="kg")
+    other = ChainNode(chain=chain, type="category", name="Additiv", role_id=additive.id, unit="kg")
     db.add_all([recovery, other])
     db.flush()
     make = next(node for node in chain.nodes if node.name == "Granulieren")
@@ -518,6 +521,7 @@ def test_material_wastes_share_one_recovery(db):
     )
     other_ds = Dataset(name="Additiv", location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
     _factor(other_ds, CLIMATE_CHANGE, 1.0)
+    other_ds.roles.append(DatasetRole(role_id=additive.id))
     db.add(other_ds)
     db.flush()
     datasets[other_ds.id] = other_ds
@@ -604,6 +608,8 @@ def test_byproduct_share_includes_recovery_and_credit(db):
     _factor(starch_ds, CLIMATE_CHANGE, 1.0)
     _factor(elec, CLIMATE_CHANGE, 0.4)
     _factor(recovery_ds, CLIMATE_CHANGE, 10.0)
+    starch_ds.roles.append(DatasetRole(role_id=starch.id))
+    elec.roles.append(DatasetRole(role_id=energy.id))
     db.add_all([starch_ds, elec, recovery_ds])
     db.flush()
     chain = Chain(name="Anteil", status="published", end_product_id=end.id, end_unit="kg")

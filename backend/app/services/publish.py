@@ -5,7 +5,7 @@ from itertools import product as cartesian
 
 from sqlalchemy.orm import Session, selectinload
 
-from app.models import Chain, Configuration, Dataset, Role
+from app.models import Chain, ChainCombination, ChainNode, Configuration, Dataset, Role
 from app.services.calculate import (
     CalcInput,
     allocation_factor,
@@ -13,6 +13,7 @@ from app.services.calculate import (
     has_cycle,
     material_waste,
     process_recovery_ids,
+    reaches,
     share_key,
 )
 from app.services.units import same_unit, unit_mismatch_message
@@ -26,11 +27,8 @@ def invalidate_configurations(db: Session, chain_id: int, reason: str) -> None:
     db.commit()
 
 
-def _shares_ok(values: list[float]) -> bool:
-    if len(values) < 2:
-        return True
-    share_sum = sum(values)
-    return abs(share_sum - 1.0) <= 1e-6 or abs(share_sum - 100.0) <= 1e-6
+def mass_balance_messages(chain: Chain) -> list[str]:
+    return [error for error in validate_structure(chain) if error.startswith("Masse an „")]
 
 
 def validate_structure(chain: Chain) -> list[str]:
@@ -100,10 +98,6 @@ def validate_structure(chain: Chain) -> list[str]:
         if len(producers) > 1:
             errors.append(f"„{by_id[product_id].name}“ darf nur einen Prozess haben.")
 
-    shares_by_category: dict[int, list] = defaultdict(list)
-    for share in chain.dataset_shares:
-        shares_by_category[share.category_node_id].append(share)
-
     for process in nodes:
         if process.type != "process":
             continue
@@ -126,14 +120,6 @@ def validate_structure(chain: Chain) -> list[str]:
                 missing_axis = True
                 continue
             axis_sets.append([(category.id, dataset_id) for dataset_id in dataset_ids])
-            if len(dataset_ids) > 1:
-                rows = [
-                    share
-                    for share in shares_by_category[category.id]
-                    if share.dataset_id in dataset_ids
-                ]
-                if len(rows) != len(dataset_ids) or not _shares_ok([share.default_share for share in rows]):
-                    errors.append(f"Default-Anteile für „{category.name}“ müssen 100 % ergeben.")
         if not missing_axis and differing:
             expected = {frozenset(choice) for choice in cartesian(*axis_sets)}
             stored = [
@@ -161,6 +147,12 @@ def validate_structure(chain: Chain) -> list[str]:
                 kind = kind_of.get((process.id, amount.category_node_id), "material")
                 if kind == "material" and amount.efficiency <= 0:
                     errors.append(f"Effizienz an „{process.name}“ muss größer als 0 sein.")
+        if functional:
+            product = _continued_product(process.id, by_id, edges, functional[0].id)
+            if product is not None and product.unit.strip():
+                errors.extend(
+                    _mass_balance_errors(process, combos, by_id, edges, kind_of, product.unit)
+                )
         has_waste = any(
             kind_of.get((process.id, amount.category_node_id), "material") == "material"
             and material_waste(amount.input_amount, amount.efficiency) > 1e-12
@@ -179,15 +171,6 @@ def validate_structure(chain: Chain) -> list[str]:
             errors.append(f"Prozess „{process.name}“ hat nur eine Verwertung.")
         elif has_waste and not recovery_ids:
             errors.append(f"Verwertung fehlt für Abfall an „{process.name}“.")
-
-        for category in categories:
-            if category.datasets_differ or category.optional:
-                continue
-            rows = shares_by_category[category.id]
-            if not rows:
-                errors.append(f"Anteile fehlen für „{category.name}“.")
-            elif not _shares_ok([share.default_share for share in rows]):
-                errors.append(f"Default-Anteile für „{category.name}“ müssen 100 % ergeben.")
 
     for node in nodes:
         if node.type == "transport":
@@ -225,6 +208,100 @@ def validate_structure(chain: Chain) -> list[str]:
             errors.append(f"„{node.name}“ ist ungleich und darf nicht optional sein.")
 
     errors.extend(_category_unit_errors(chain))
+    return errors
+
+
+def _format_mass(value: float) -> str:
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    if text in {"", "-0"}:
+        text = "0"
+    return text.replace(".", ",")
+
+
+def _continued_product(
+    process_id: int, nodes: dict[int, ChainNode], edges: list, functional_id: int
+) -> ChainNode | None:
+    outs = []
+    for edge in edges:
+        if edge.source_id != process_id or edge.kind != "material":
+            continue
+        target = nodes.get(edge.target_id)
+        if target is not None and target.type == "product" and reaches(edges, target.id, functional_id):
+            outs.append(target)
+    if len(outs) != 1:
+        return None
+    return outs[0]
+
+
+def _incoming_product_mass(
+    process_id: int, nodes: dict[int, ChainNode], edges: list, product_unit: str
+) -> tuple[float, bool]:
+    """Sollmenge von Zwischenprodukten. Kategorien stehen in der Kombination."""
+    total = 0.0
+    counted = False
+    for edge in edges:
+        if edge.kind != "material" or edge.target_id != process_id:
+            continue
+        source = nodes.get(edge.source_id)
+        if source is None:
+            continue
+        if source.type == "transport":
+            origin = _transport_origin(nodes, edges, source.id)
+            if origin is None or origin.type != "product":
+                continue
+            unit = origin.unit
+        elif source.type == "product":
+            unit = source.unit
+        else:
+            continue
+        if not same_unit(unit, product_unit):
+            continue
+        total += edge.input_amount
+        counted = True
+    return total, counted
+
+
+def _combination_label(combo: ChainCombination) -> str:
+    names: list[str] = []
+    for axis in combo.axes:
+        if axis.dataset_id is None:
+            continue
+        names.append(axis.dataset.name if axis.dataset is not None else "Datensatz")
+    if not names:
+        return ""
+    return " (" + " × ".join(names) + ")"
+
+
+def _mass_balance_errors(
+    process: ChainNode,
+    combos: list[ChainCombination],
+    nodes: dict[int, ChainNode],
+    edges: list,
+    kind_of: dict[tuple[int, int], str],
+    product_unit: str,
+) -> list[str]:
+    edge_mass, edge_counted = _incoming_product_mass(process.id, nodes, edges, product_unit)
+    errors: list[str] = []
+    for combo in combos:
+        total = edge_mass
+        counted = edge_counted
+        for amount in combo.amounts:
+            category = nodes.get(amount.category_node_id)
+            if category is None:
+                continue
+            if kind_of.get((process.id, amount.category_node_id), "material") != "material":
+                continue
+            if not same_unit(category.unit, product_unit):
+                continue
+            total += amount.input_amount
+            counted = True
+        if not counted or abs(total - 1.0) <= 1e-6:
+            continue
+        shown = _format_mass(total)
+        errors.append(
+            f"Masse an „{process.name}“{_combination_label(combo)} ist {shown} {product_unit} "
+            f"je 1 {product_unit}, erwartet 1 {product_unit}."
+        )
     return errors
 
 

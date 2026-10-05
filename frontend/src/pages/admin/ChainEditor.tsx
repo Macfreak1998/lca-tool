@@ -366,6 +366,73 @@ export function ChainEditorPage() {
     });
   }
 
+  function combinationMass(
+    processKey: string,
+    combo: DraftCombination,
+  ): { total: number; unit: string } | null {
+    const functional = nodes.find((node) => node.is_functional);
+    if (!functional) return null;
+    const continued = edges.filter((edge) => {
+      if (edge.source !== processKey || edge.kind !== "material") return false;
+      const target = nodes.find((node) => node.key === edge.target);
+      return target?.type === "product" && reaches(target.key, functional.key, edges);
+    });
+    if (continued.length !== 1) return null;
+    const product = nodes.find((node) => node.key === continued[0].target);
+    if (!product?.unit.trim()) return null;
+    let total = 0;
+    let counted = false;
+    for (const edge of edges) {
+      if (edge.kind !== "material" || edge.target !== processKey) continue;
+      const source = nodes.find((node) => node.key === edge.source);
+      if (!source) continue;
+      let unit = "";
+      if (source.type === "product") {
+        unit = source.unit;
+      } else if (source.type === "transport") {
+        const inbound = edges.find((item) => item.target === source.key && item.kind === "material");
+        const origin = inbound ? nodes.find((node) => node.key === inbound.source) : undefined;
+        if (origin?.type !== "product") continue;
+        unit = origin.unit;
+      } else {
+        continue;
+      }
+      if (!sameUnit(unit, product.unit)) continue;
+      total += edge.input_amount;
+      counted = true;
+    }
+    for (const amount of combo.amounts) {
+      if (!materialInput(processKey, amount.category_key)) continue;
+      const category = nodes.find((node) => node.key === amount.category_key);
+      if (!category || !sameUnit(category.unit, product.unit)) continue;
+      total += amount.input_amount;
+      counted = true;
+    }
+    if (!counted) return null;
+    return { total, unit: product.unit };
+  }
+
+  function massBalanceErrors(): string[] {
+    const errors: string[] = [];
+    for (const process of nodes) {
+      if (process.type !== "process") continue;
+      for (const combo of combinations) {
+        if (combo.process_key !== process.key) continue;
+        const mass = combinationMass(process.key, combo);
+        if (!mass || Math.abs(mass.total - 1) <= 1e-6) continue;
+        const axes = combo.axes
+          .map((axis) => datasets.find((item) => item.id === axis.dataset_id)?.name || "Datensatz")
+          .join(" × ");
+        const label = axes ? ` (${axes})` : "";
+        const shown = String(Math.round((mass.total + Number.EPSILON) * 1e6) / 1e6).replace(".", ",");
+        errors.push(
+          `Masse an „${process.name}“${label} ist ${shown} ${mass.unit} je 1 ${mass.unit}, erwartet 1 ${mass.unit}.`,
+        );
+      }
+    }
+    return errors;
+  }
+
   function processHasWaste(processKey: string): boolean {
     const fromAmounts = combinations.some(
       (combo) =>
@@ -515,6 +582,11 @@ export function ChainEditorPage() {
   async function save(): Promise<boolean> {
     setError("");
     setMessage("");
+    const massErrors = massBalanceErrors();
+    if (massErrors.length > 0) {
+      setError(massErrors.join(" "));
+      return false;
+    }
     try {
       const saved = await DataApi.saveChain(chainId, {
         name: chain?.name,
@@ -771,8 +843,11 @@ export function ChainEditorPage() {
                     <p className="text-xs text-slate-500">Kategorien mit dem Prozess verbinden. Ungleiche Kategorien brauchen Datensätze.</p>
                   )}
                   <div className="space-y-3">
-                    {processCombinations.map((combo) => (
-                      <div key={combo.key} className="space-y-2 rounded-lg bg-slate-50 p-3">
+                    {processCombinations.map((combo) => {
+                      const mass = combinationMass(selectedNode.key, combo);
+                      const massOk = mass != null && Math.abs(mass.total - 1) <= 1e-6;
+                      return (
+                        <div key={combo.key} className="space-y-2 rounded-lg bg-slate-50 p-3">
                         <p className="text-sm font-medium">
                           {combo.axes.length
                             ? combo.axes
@@ -853,8 +928,16 @@ export function ChainEditorPage() {
                             </div>
                           );
                         })}
-                      </div>
-                    ))}
+                        {mass && (
+                          <p className={massOk ? "text-xs text-slate-500" : "text-xs text-red-700"}>
+                            {massOk
+                              ? `Masse ${formatQuantity(mass.total)} ${mass.unit}`
+                              : `Masse ${formatQuantity(mass.total)} ${mass.unit} · erwartet 1 ${mass.unit}`}
+                          </p>
+                        )}
+                        </div>
+                      );
+                    })}
                   </div>
                   {processHasWaste(selectedNode.key) && (
                     <label className="block text-sm">

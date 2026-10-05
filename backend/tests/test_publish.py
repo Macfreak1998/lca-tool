@@ -12,6 +12,7 @@ from app.models import (
     Dataset,
     DatasetExchange,
     DatasetFactor,
+    DatasetRole,
     EndProduct,
     Role,
 )
@@ -44,6 +45,7 @@ def _energy(db, chain, role, process, ds, *, amount=1.0):
     db.add(combo)
     db.flush()
     db.add(ChainCombinationAmount(combination=combo, category_node_id=energy.id, input_amount=amount))
+    ds.roles.append(DatasetRole(role_id=role.id))
     db.add(
         ChainDatasetShare(
             chain=chain, category_node_id=energy.id, dataset_id=ds.id, default_share=1.0
@@ -152,7 +154,7 @@ def test_publish_blocks_on_bad_shares(db):
         )
     db.flush()
     errors = validate_structure(chain)
-    assert any("100" in msg for msg in errors)
+    assert not any("100" in msg or "Anteile" in msg for msg in errors)
 
 
 def test_publish_blocks_transport_on_energy(db):
@@ -281,6 +283,165 @@ def test_publish_blocks_two_recoveries(db):
     db.flush()
     errors = validate_structure(chain)
     assert any("nur eine Verwertung" in message for message in errors)
+
+
+def _kg_dataset(db, name: str) -> Dataset:
+    dataset = Dataset(name=name, location="DE", unit="kg", source_kind=SOURCE_ECOINVENT)
+    dataset.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=CLIMATE_CHANGE, value=1.0))
+    db.add(dataset)
+    db.flush()
+    return dataset
+
+
+def _recipe(db, chain, process, parts: list[tuple[ChainNode, float]]) -> ChainCombination:
+    combo = ChainCombination(chain=chain, process_node_id=process.id)
+    db.add(combo)
+    db.flush()
+    for category, amount in parts:
+        db.add(
+            ChainCombinationAmount(
+                combination=combo, category_node_id=category.id, input_amount=amount, efficiency=1.0
+            )
+        )
+    db.flush()
+    return combo
+
+
+def test_publish_accepts_closed_mass(db):
+    chain, _role, _folie, process = _base(db)
+    starch_role = Role(slug="staerke", label="Stärke")
+    additive_role = Role(slug="additiv", label="Additiv")
+    db.add_all([starch_role, additive_role])
+    db.flush()
+    starch_ds = _kg_dataset(db, "Kartoffelstärke")
+    additive_ds = _kg_dataset(db, "Additiv")
+    starch_ds.roles.append(DatasetRole(role_id=starch_role.id))
+    additive_ds.roles.append(DatasetRole(role_id=additive_role.id))
+    starch = ChainNode(chain=chain, type="category", name="Stärke", role_id=starch_role.id, unit="kg")
+    additive = ChainNode(chain=chain, type="category", name="Additiv", role_id=additive_role.id, unit="kg")
+    db.add_all([starch, additive])
+    db.flush()
+    db.add_all(
+        [
+            ChainEdge(chain=chain, source_id=starch.id, target_id=process.id, kind="material"),
+            ChainEdge(chain=chain, source_id=additive.id, target_id=process.id, kind="material"),
+        ]
+    )
+    _recipe(db, chain, process, [(starch, 0.95), (additive, 0.05)])
+    db.add_all(
+        [
+            ChainDatasetShare(chain=chain, category_node_id=starch.id, dataset_id=starch_ds.id, default_share=1.0),
+            ChainDatasetShare(chain=chain, category_node_id=additive.id, dataset_id=additive_ds.id, default_share=1.0),
+        ]
+    )
+    db.flush()
+    ok, errs = probe_and_publish(db, chain)
+    assert ok, errs
+    assert chain.status == "published"
+
+
+def test_publish_blocks_open_mass(db):
+    chain, _role, _folie, process = _base(db)
+    starch_role = Role(slug="staerke", label="Stärke")
+    additive_role = Role(slug="additiv", label="Additiv")
+    db.add_all([starch_role, additive_role])
+    db.flush()
+    starch_ds = _kg_dataset(db, "Kartoffelstärke")
+    additive_ds = _kg_dataset(db, "Additiv")
+    starch = ChainNode(chain=chain, type="category", name="Stärke", role_id=starch_role.id, unit="kg")
+    additive = ChainNode(chain=chain, type="category", name="Additiv", role_id=additive_role.id, unit="kg")
+    db.add_all([starch, additive])
+    db.flush()
+    db.add_all(
+        [
+            ChainEdge(chain=chain, source_id=starch.id, target_id=process.id, kind="material"),
+            ChainEdge(chain=chain, source_id=additive.id, target_id=process.id, kind="material"),
+        ]
+    )
+    _recipe(db, chain, process, [(starch, 0.0), (additive, 0.05)])
+    db.add_all(
+        [
+            ChainDatasetShare(chain=chain, category_node_id=starch.id, dataset_id=starch_ds.id, default_share=1.0),
+            ChainDatasetShare(chain=chain, category_node_id=additive.id, dataset_id=additive_ds.id, default_share=1.0),
+        ]
+    )
+    db.flush()
+    errors = validate_structure(chain)
+    assert "Masse an „Herstellung“ ist 0,05 kg je 1 kg, erwartet 1 kg." in errors
+    ok, errs = probe_and_publish(db, chain)
+    assert not ok
+    assert chain.status == "draft"
+
+
+def test_publish_skips_mass_check_for_energy_only(db):
+    chain, role, _folie, process = _base(db)
+    ds = Dataset(name="Strom", location="DE", unit="kWh", source_kind=SOURCE_ECOINVENT)
+    ds.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=CLIMATE_CHANGE, value=0.4))
+    db.add(ds)
+    db.flush()
+    _energy(db, chain, role, process, ds)
+    errors = validate_structure(chain)
+    assert errors == []
+    assert not any(msg.startswith("Masse") for msg in errors)
+
+
+def test_publish_accepts_product_edge_mass(db):
+    chain, role, _folie, process = _base(db)
+    ds = Dataset(name="Strom", location="DE", unit="kWh", source_kind=SOURCE_ECOINVENT)
+    ds.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=CLIMATE_CHANGE, value=0.4))
+    db.add(ds)
+    db.flush()
+    _energy(db, chain, role, process, ds)
+    granulat = ChainNode(chain=chain, type="product", name="Granulat", unit="kg")
+    db.add(granulat)
+    db.flush()
+    link = ChainEdge(
+        chain=chain, source_id=granulat.id, target_id=process.id, kind="material", input_amount=1.0
+    )
+    db.add(link)
+    db.flush()
+    errors = validate_structure(chain)
+    assert not any(msg.startswith("Masse") for msg in errors)
+    link.input_amount = 0.5
+    db.flush()
+    errors = validate_structure(chain)
+    assert "Masse an „Herstellung“ ist 0,5 kg je 1 kg, erwartet 1 kg." in errors
+
+
+def test_publish_counts_category_mass_once_through_transport(db):
+    chain, _role, _folie, process = _base(db)
+    starch_role = Role(slug="staerke", label="Stärke")
+    db.add(starch_role)
+    db.flush()
+    starch_ds = _kg_dataset(db, "Kartoffelstärke")
+    starch_ds.roles.append(DatasetRole(role_id=starch_role.id))
+    truck = Dataset(name="Lkw", location="DE", unit="kg·km", source_kind=SOURCE_ECOINVENT)
+    db.add(truck)
+    db.flush()
+    starch = ChainNode(chain=chain, type="category", name="Stärke", role_id=starch_role.id, unit="kg")
+    haul = ChainNode(
+        chain=chain, type="transport", name="Transport Stärke", dataset_id=truck.id, unit="kg·km", distance_km=10
+    )
+    db.add_all([starch, haul])
+    db.flush()
+    db.add_all(
+        [
+            ChainEdge(chain=chain, source_id=starch.id, target_id=haul.id, kind="material"),
+            ChainEdge(chain=chain, source_id=haul.id, target_id=process.id, kind="material", input_amount=1.0),
+        ]
+    )
+    combo = _recipe(db, chain, process, [(starch, 1.0)])
+    db.add(
+        ChainDatasetShare(chain=chain, category_node_id=starch.id, dataset_id=starch_ds.id, default_share=1.0)
+    )
+    db.flush()
+    errors = validate_structure(chain)
+    assert not any(msg.startswith("Masse") for msg in errors)
+    amount = next(row for row in combo.amounts if row.category_node_id == starch.id)
+    amount.input_amount = 0.4
+    db.flush()
+    errors = validate_structure(chain)
+    assert "Masse an „Herstellung“ ist 0,4 kg je 1 kg, erwartet 1 kg." in errors
 
 
 def test_publish_without_lcia_uses_inventory(db, monkeypatch):

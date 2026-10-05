@@ -41,7 +41,7 @@ export function ConfigurationsPage() {
                 </td>
                 <td>{row.invalid ? row.invalid_reason || "ungültig" : "gültig"}</td>
                 <td className="space-x-3 text-right">
-                  <Link className="text-forest-700 underline" to={`/?chain=${row.chain_id}`}>
+                  <Link className="text-forest-700 underline" to={`/?config=${row.id}`}>
                     Öffnen
                   </Link>
                   <button

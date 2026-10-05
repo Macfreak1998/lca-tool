@@ -3,6 +3,7 @@ import type {
   CalcResult,
   CalculatePayload,
   Chain,
+  ChainNode,
   Configuration,
   Dataset,
   EndProduct,
@@ -102,6 +103,7 @@ export const DataApi = {
   calculate: (payload: CalculatePayload) =>
     api<CalcResult>("/api/calculate", { method: "POST", body: JSON.stringify(payload) }),
   configurations: () => api<Configuration[]>("/api/configurations"),
+  configuration: (id: number) => api<Configuration>(`/api/configurations/${id}`),
   saveConfiguration: (body: unknown) =>
     api<Configuration>("/api/configurations", { method: "POST", body: JSON.stringify(body) }),
   updateConfiguration: (id: number, body: unknown) =>
@@ -138,21 +140,81 @@ export async function download(path: string, body: unknown, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-export function defaultPayload(chain: Chain): CalculatePayload {
+function byName(a: Dataset, b: Dataset) {
+  if (a.name < b.name) return -1;
+  if (a.name > b.name) return 1;
+  return a.id - b.id;
+}
+
+export function datasetsForCategory(chain: Chain, category: ChainNode, catalog: Dataset[], own: Dataset[]): Dataset[] {
+  if (category.datasets_differ) {
+    const ids = new Set(
+      chain.combinations.flatMap((combo) =>
+        combo.axes
+          .filter((axis) => axis.category_node_id === category.id && axis.dataset_id != null)
+          .map((axis) => axis.dataset_id as number),
+      ),
+    );
+    const pool = [...catalog, ...own].filter((item) => ids.has(item.id));
+    return [
+      ...pool.filter((item) => item.source_kind !== "user").sort(byName),
+      ...pool.filter((item) => item.source_kind === "user").sort(byName),
+    ];
+  }
+  const roleId = category.role_id;
+  return [
+    ...catalog.filter((item) => roleId != null && item.role_ids.includes(roleId)).sort(byName),
+    ...own.filter((item) => roleId != null && item.role_ids.includes(roleId)).sort(byName),
+  ];
+}
+
+export function defaultPayload(chain: Chain, catalog: Dataset[] = [], own: Dataset[] = []): CalculatePayload {
   const selections: Record<string, number> = {};
-  const shares: Record<string, number> = {};
   chain.nodes.forEach((node) => {
     if (node.dataset_id) selections[String(node.id)] = node.dataset_id;
-  });
-  chain.dataset_shares.forEach((share) => {
-    shares[`${share.category_node_id}:${share.dataset_id}`] = share.default_share;
+    if (node.type !== "category") return;
+    const first = datasetsForCategory(chain, node, catalog, own)[0];
+    if (first) selections[String(node.id)] = first.id;
   });
   return {
     chain_id: chain.id,
     end_amount: 1,
     selections,
-    shares,
+    shares: {},
     optional_on: [],
     replaced_nodes: {},
+  };
+}
+
+export function payloadFromConfiguration(
+  chain: Chain,
+  config: Configuration,
+  catalog: Dataset[],
+  own: Dataset[],
+): { payload: CalculatePayload; missing: string[] } {
+  const payload = defaultPayload(chain, catalog, own);
+  const missing: string[] = [];
+  const selections = { ...payload.selections };
+  for (const node of chain.nodes) {
+    if (node.type !== "category") continue;
+    const saved = config.selections[String(node.id)];
+    const options = datasetsForCategory(chain, node, catalog, own);
+    if (saved != null && options.some((item) => item.id === saved)) selections[String(node.id)] = saved;
+    else if (saved != null) missing.push(node.name);
+  }
+  for (const [nodeId, datasetId] of Object.entries(config.selections)) {
+    const node = chain.nodes.find((item) => String(item.id) === nodeId);
+    if (node && node.type !== "category") selections[nodeId] = datasetId;
+  }
+  return {
+    payload: {
+      ...payload,
+      end_amount: config.end_amount,
+      selections,
+      shares: config.shares,
+      optional_on: config.optional_on,
+      replaced_nodes: config.replaced_nodes,
+    },
+    missing,
   };
 }

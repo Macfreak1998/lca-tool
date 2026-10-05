@@ -7,7 +7,7 @@ import pytest
 from app.config import settings
 from app.constants import CLIMATE_CHANGE
 from app.models import Chain, Dataset, Role
-from app.services.calculate import CalcInput, calculate
+from app.services.calculate import CalcInput, calculate, category_dataset_options
 from app.services.demo import EXAMPLE_CHAIN_NAME, seed_demo
 
 
@@ -30,9 +30,10 @@ def test_seed_demo_creates_published_chain(db, fixtures_dir: Path, tmp_path: Pat
     example = db.query(Chain).filter(Chain.name == EXAMPLE_CHAIN_NAME).one()
     assert maize.status == "published"
     assert example.status == "published"
-    assert db.query(Dataset).count() == 6
+    assert db.query(Dataset).count() == 12
     seed_demo(db)
     assert db.query(Chain).count() == 2
+    assert db.query(Dataset).count() == 12
 
 
 def test_example_chain_seeds_without_archive(db, monkeypatch):
@@ -46,8 +47,18 @@ def test_example_chain_seeds_without_archive(db, monkeypatch):
     result = calculate(chain, CalcInput(end_amount=1.0), datasets, roles)
     assert result.blockers == []
     assert result.totals[CLIMATE_CHANGE] == pytest.approx(2.209803921568627)
+
+    def option_names(node_name: str) -> list[str]:
+        node = next(item for item in chain.nodes if item.name == node_name)
+        return [item.name for item in category_dataset_options(node, datasets, list(chain.combinations))]
+
+    assert option_names("Kartoffelstärke") == ["Kartoffelstärke", "Maisstärke", "Weizenstärke"]
+    assert option_names("Additiv") == ["Additiv", "Füllstoff", "Weichmacher"]
+    assert option_names("Strom Spritzguss") == ["Strom", "Strommix EU", "Ökostrom"]
+    assert option_names("Strom Granulieren") == ["Strom", "Strommix EU", "Ökostrom"]
     seed_demo(db)
     assert db.query(Chain).filter(Chain.name == EXAMPLE_CHAIN_NAME).count() == 1
+    assert db.query(Dataset).count() == 11
 
 
 def test_seed_demo_off_by_default(db, monkeypatch):

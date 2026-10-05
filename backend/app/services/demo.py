@@ -278,28 +278,25 @@ def _seed_maize_demo(db: Session) -> None:
 
 
 def seed_example_chain(db: Session) -> None:
-    if db.query(Chain).filter(Chain.name == EXAMPLE_CHAIN_NAME).first() is not None:
-        return
     starch = _role(db, "starke", "Stärke")
     additive = _role(db, "additiv", "Additiv")
     power = _role(db, "strommix", "Strommix")
+    catalog = _example_catalog(db, starch, additive, power)
+    existing = db.query(Chain).filter(Chain.name == EXAMPLE_CHAIN_NAME).first()
+    if existing is not None:
+        _ensure_starch_choices(db, existing, starch)
+        db.commit()
+        return
     product = db.query(EndProduct).filter(EndProduct.name == "Kunststoffteil").first()
     if product is None:
         product = EndProduct(name="Kunststoffteil", unit="kg")
         db.add(product)
         db.flush()
-    starch_ds = _example_dataset(db, "Kartoffelstärke")
-    additive_ds = _example_dataset(db, "Additiv")
-    power_ds = _example_dataset(db, "Strom")
-    truck_ds = _example_dataset(db, "Lkw")
-    recovery_ds = _example_dataset(db, "Verwertung")
-    for dataset, role in (
-        (starch_ds, starch),
-        (additive_ds, additive),
-        (power_ds, power),
-    ):
-        if not any(link.role_id == role.id for link in dataset.roles):
-            dataset.roles.append(DatasetRole(role_id=role.id))
+    starch_ds = catalog["Kartoffelstärke"]
+    additive_ds = catalog["Additiv"]
+    power_ds = catalog["Strom"]
+    truck_ds = catalog["Lkw"]
+    recovery_ds = catalog["Verwertung"]
     chain = Chain(
         name=EXAMPLE_CHAIN_NAME,
         status=CHAIN_DRAFT,
@@ -312,7 +309,9 @@ def seed_example_chain(db: Session) -> None:
     granulate = _node(chain, "product", "Granulat", x=460, y=180, unit="kg")
     compound = _node(chain, "process", "Granulieren", x=250, y=180, unit="kg")
     mould = _node(chain, "process", "Spritzguss", x=700, y=180, unit="kg")
-    starch_node = _node(chain, "category", "Kartoffelstärke", x=20, y=40, unit="kg", role_id=starch.id)
+    starch_node = _node(
+        chain, "category", "Kartoffelstärke", x=20, y=40, unit="kg", role_id=starch.id, datasets_differ=True
+    )
     additive_node = _node(chain, "category", "Additiv", x=20, y=180, unit="kg", role_id=additive.id)
     power_compound = _node(chain, "category", "Strom Granulieren", x=20, y=320, unit="kWh", role_id=power.id)
     power_mould = _node(chain, "category", "Strom Spritzguss", x=520, y=40, unit="kWh", role_id=power.id)
@@ -367,40 +366,18 @@ def seed_example_chain(db: Session) -> None:
             ChainEdge(chain=chain, source_id=mould.id, target_id=recover_mould.id, kind="waste"),
         ]
     )
-    compound_combo = ChainCombination(chain=chain, process_node_id=compound.id)
     mould_combo = ChainCombination(chain=chain, process_node_id=mould.id)
-    db.add_all([compound_combo, mould_combo])
+    db.add(mould_combo)
     db.flush()
-    db.add_all(
-        [
-            ChainCombinationAmount(
-                combination=compound_combo,
-                category_node_id=starch_node.id,
-                input_amount=0.95,
-                efficiency=0.90,
-                recovery_node_id=recover_compound.id,
-            ),
-            ChainCombinationAmount(
-                combination=compound_combo,
-                category_node_id=additive_node.id,
-                input_amount=0.05,
-                efficiency=0.85,
-                recovery_node_id=recover_compound.id,
-            ),
-            ChainCombinationAmount(
-                combination=compound_combo,
-                category_node_id=power_compound.id,
-                input_amount=0.80,
-                efficiency=1.0,
-            ),
-            ChainCombinationAmount(
-                combination=mould_combo,
-                category_node_id=power_mould.id,
-                input_amount=1.50,
-                efficiency=1.0,
-            ),
-        ]
+    db.add(
+        ChainCombinationAmount(
+            combination=mould_combo,
+            category_node_id=power_mould.id,
+            input_amount=1.50,
+            efficiency=1.0,
+        )
     )
+    _ensure_starch_choices(db, chain, starch)
     for category, dataset in (
         (starch_node, starch_ds),
         (additive_node, additive_ds),
@@ -431,17 +408,119 @@ def _role(db: Session, slug: str, label: str) -> Role:
     return role
 
 
-def _example_dataset(db: Session, name: str) -> Dataset:
+# Weitere Katalogeinträge derselben Kategorie, skaliert aus dem Prüfwert-Profil.
+_EXAMPLE_CHOICES: tuple[tuple[str, str, str, float, str], ...] = (
+    ("Kartoffelstärke", "Prüfwert", "Kartoffelstärke", 1.0, "starch"),
+    ("Maisstärke", "DE", "Kartoffelstärke", 0.85, "starch"),
+    ("Weizenstärke", "FR", "Kartoffelstärke", 1.2, "starch"),
+    ("Additiv", "Prüfwert", "Additiv", 1.0, "additive"),
+    ("Füllstoff", "DE", "Additiv", 0.55, "additive"),
+    ("Weichmacher", "EU", "Additiv", 1.35, "additive"),
+    ("Strom", "Prüfwert", "Strom", 1.0, "power"),
+    ("Strommix EU", "EU", "Strom", 0.7, "power"),
+    ("Ökostrom", "DE", "Strom", 0.15, "power"),
+    ("Lkw", "Prüfwert", "Lkw", 1.0, ""),
+    ("Verwertung", "Prüfwert", "Verwertung", 1.0, ""),
+)
+
+
+def _example_catalog(db: Session, starch: Role, additive: Role, power: Role) -> dict[str, Dataset]:
+    roles = {"starch": starch, "additive": additive, "power": power}
+    created: dict[str, Dataset] = {}
+    for name, location, profile, scale, role_key in _EXAMPLE_CHOICES:
+        dataset = _example_dataset(db, name, location=location, profile=profile, scale=scale)
+        if role_key:
+            _assign_role(dataset, roles[role_key])
+        if location == "Prüfwert":
+            created[name] = dataset
+    return created
+
+
+def _ensure_starch_choices(db: Session, chain: Chain, starch_role: Role) -> None:
+    starch_node = next((node for node in chain.nodes if node.type == "category" and node.name == "Kartoffelstärke"), None)
+    compound = next((node for node in chain.nodes if node.type == "process" and node.name == "Granulieren"), None)
+    additive = next((node for node in chain.nodes if node.type == "category" and node.name == "Additiv"), None)
+    power = next((node for node in chain.nodes if node.type == "category" and node.name == "Strom Granulieren"), None)
+    recovery = next((node for node in chain.nodes if node.type == "recovery" and node.name == "Verwertung Granulieren"), None)
+    if starch_node is None or compound is None or additive is None or power is None:
+        return
+    starch_node.datasets_differ = True
+    choices = (
+        db.query(Dataset)
+        .join(DatasetRole)
+        .filter(DatasetRole.role_id == starch_role.id, Dataset.source_kind == SOURCE_CATALOG_MANUAL)
+        .all()
+    )
+    combos = [combo for combo in chain.combinations if combo.process_node_id == compound.id]
+    covered: set[int] = set()
+    template: ChainCombination | None = None
+    for combo in combos:
+        for axis in combo.axes:
+            if axis.category_node_id == starch_node.id and axis.dataset_id is not None:
+                covered.add(axis.dataset_id)
+                dataset = db.get(Dataset, axis.dataset_id)
+                if template is None or (dataset is not None and dataset.name == "Kartoffelstärke"):
+                    template = combo
+    defaults = (
+        (starch_node.id, 0.95, 0.90, recovery.id if recovery is not None else None),
+        (additive.id, 0.05, 0.85, recovery.id if recovery is not None else None),
+        (power.id, 0.80, 1.0, None),
+    )
+    for dataset in choices:
+        if dataset.id in covered:
+            continue
+        combo = ChainCombination(chain=chain, process_node_id=compound.id)
+        db.add(combo)
+        db.flush()
+        db.add(ChainCombinationAxis(combination=combo, category_node_id=starch_node.id, dataset_id=dataset.id))
+        if template is not None:
+            for amount in template.amounts:
+                db.add(
+                    ChainCombinationAmount(
+                        combination=combo,
+                        category_node_id=amount.category_node_id,
+                        input_amount=amount.input_amount,
+                        efficiency=amount.efficiency,
+                        recovery_node_id=amount.recovery_node_id,
+                    )
+                )
+        else:
+            for category_id, input_amount, efficiency, recovery_id in defaults:
+                db.add(
+                    ChainCombinationAmount(
+                        combination=combo,
+                        category_node_id=category_id,
+                        input_amount=input_amount,
+                        efficiency=efficiency,
+                        recovery_node_id=recovery_id,
+                    )
+                )
+        covered.add(dataset.id)
+
+
+def _assign_role(dataset: Dataset, role: Role) -> None:
+    if not any(link.role_id == role.id for link in dataset.roles):
+        dataset.roles.append(DatasetRole(role_id=role.id))
+
+
+def _example_dataset(
+    db: Session,
+    name: str,
+    *,
+    location: str = "Prüfwert",
+    profile: str | None = None,
+    scale: float = 1.0,
+) -> Dataset:
     dataset = (
         db.query(Dataset)
-        .filter(Dataset.name == name, Dataset.location == "Prüfwert", Dataset.source_kind == SOURCE_CATALOG_MANUAL)
+        .filter(Dataset.name == name, Dataset.location == location, Dataset.source_kind == SOURCE_CATALOG_MANUAL)
         .one_or_none()
     )
-    unit, factors = _EXAMPLE_PROFILES[name]
+    unit, factors = _EXAMPLE_PROFILES[profile or name]
     if dataset is None:
         dataset = Dataset(
             name=name,
-            location="Prüfwert",
+            location=location,
             unit=unit,
             source_kind=SOURCE_CATALOG_MANUAL,
             source_note=_EXAMPLE_NOTE,
@@ -453,7 +532,7 @@ def _example_dataset(db: Session, name: str) -> Dataset:
     present = {row.indicator_id for row in dataset.factors}
     for indicator_id, value in factors.items():
         if indicator_id not in present:
-            dataset.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=indicator_id, value=value))
+            dataset.factors.append(DatasetFactor(method_id=METHOD_ID, indicator_id=indicator_id, value=value * scale))
     return dataset
 
 

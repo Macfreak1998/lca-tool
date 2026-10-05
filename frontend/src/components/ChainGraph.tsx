@@ -22,6 +22,7 @@ export type GraphNode = {
   y: number;
   is_functional: boolean;
   optional: boolean;
+  datasetLabel?: string;
 };
 
 export type GraphEdge = {
@@ -52,15 +53,19 @@ const KIND_CLASS: Record<NodeType, string> = {
 
 function FlowNode({ data }: NodeProps) {
   const kind = data.kind as NodeType;
+  const pickable = typeof data.datasetLabel === "string";
   return (
-    <div className={`min-w-[140px] rounded-lg border px-3 py-2 shadow-sm ${KIND_CLASS[kind]} ${data.functional ? "ring-2 ring-forest-700" : ""}`}>
-      <Handle type="target" position={Position.Left} />
+      <div className={`min-w-[140px] rounded-lg border px-3 py-2 shadow-sm ${pickable ? "cursor-pointer" : ""} ${KIND_CLASS[kind]} ${data.functional ? "ring-2 ring-forest-700" : ""} ${data.selected ? "ring-2 ring-amber-500" : ""}`}>
+      <Handle type="target" position={Position.Left} className={pickable ? "!pointer-events-none" : undefined} />
       <div className="text-[10px] uppercase tracking-wide text-slate-500">
         {data.functional ? "Endprodukt" : KIND_LABEL[kind]}
         {data.optional ? " · optional" : ""}
       </div>
       <div className="font-semibold text-slate-800">{String(data.label)}</div>
-      <Handle type="source" position={Position.Right} />
+      {pickable && (
+        <div className="mt-1 text-xs font-normal text-amber-900">{String(data.datasetLabel) || "Datensatz wählen"}</div>
+      )}
+      <Handle type="source" position={Position.Right} className={pickable ? "!pointer-events-none" : undefined} />
     </div>
   );
 }
@@ -84,6 +89,7 @@ export function ChainGraph({
   nodes,
   edges,
   readOnly = false,
+  selectedKey = null,
   onMove,
   onConnect,
   onRemoveNode,
@@ -93,6 +99,7 @@ export function ChainGraph({
   nodes: GraphNode[];
   edges: GraphEdge[];
   readOnly?: boolean;
+  selectedKey?: string | null;
   onMove?: (key: string, x: number, y: number) => void;
   onConnect?: (source: string, target: string) => void;
   onRemoveNode?: (key: string) => void;
@@ -110,10 +117,14 @@ export function ChainGraph({
           kind: node.type,
           functional: node.is_functional,
           optional: node.optional,
+          selected: node.key === selectedKey,
+          datasetLabel: node.datasetLabel,
         },
+        selectable: node.datasetLabel != null || undefined,
+        className: node.datasetLabel != null ? "nopan" : undefined,
         deletable: !readOnly && !node.is_functional,
       })),
-    [nodes, readOnly],
+    [nodes, readOnly, selectedKey],
   );
   const rfEdges = useMemo<Edge[]>(
     () =>
@@ -137,10 +148,14 @@ export function ChainGraph({
         fitView
         nodesDraggable={!readOnly}
         nodesConnectable={!readOnly}
-        elementsSelectable={!readOnly}
+        elementsSelectable={!readOnly || Boolean(onSelect)}
         onNodeClick={(_event: MouseEvent, node: Node) => onSelect?.(node.id)}
         onEdgeClick={(_event: MouseEvent, edge: Edge) => onSelect?.(edge.id)}
-        onPaneClick={() => onSelect?.(null)}
+        onPaneClick={(event) => {
+          const target = event.target as HTMLElement | null;
+          if (target?.closest(".react-flow__node")) return;
+          onSelect?.(null);
+        }}
         onNodeDragStop={(_event, node) => onMove?.(node.id, node.position.x, node.position.y)}
         onConnect={(connection: Connection) => {
           if (connection.source && connection.target) onConnect?.(connection.source, connection.target);
